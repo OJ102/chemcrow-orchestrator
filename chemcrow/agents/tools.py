@@ -43,6 +43,9 @@ def make_tools(llm: BaseLanguageModel, api_keys: dict = {}, local_rxn: bool=Fals
             openai_api_key=openai_api_key,
             semantic_scholar_api_key=semantic_scholar_api_key
         ),
+        # Scaffold -- see chemcrow/tools/custom.py. Once it needs an API key,
+        # gate it the same way GetMoleculePrice/WebSearch are gated below.
+        CustomTool(),
     ]
     if chemspace_api_key:
         all_tools += [GetMoleculePrice(chemspace_api_key)]

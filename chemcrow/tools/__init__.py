@@ -7,3 +7,4 @@ from .safety import *  # noqa
 from .chemspace import *  # noqa
 from .converters import *  # noqa
 from .reactions import *  # noqa
+from .custom import *  # noqa

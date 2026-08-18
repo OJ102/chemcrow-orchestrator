@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import langchain
@@ -10,8 +11,15 @@ from rmrkl import ChatZeroShotAgent, RetryAgentExecutor
 from .prompts import FORMAT_INSTRUCTIONS, QUESTION_PROMPT, REPHRASE_TEMPLATE, SUFFIX
 from .tools import make_tools
 
+# Local model served by Ollama, used by default. Ollama exposes an
+# OpenAI-compatible /v1 endpoint, so no OpenAI account/key is needed.
+CHEMCROW_MODEL = os.getenv("CHEMCROW_MODEL", "qwen3.5:35b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
-def _make_llm(model, temp, api_key, streaming: bool = False):
+
+def _make_llm(
+    model, temp, api_key, streaming: bool = False, ollama_base_url: Optional[str] = None
+):
     if model.startswith("gpt-3.5-turbo") or model.startswith("gpt-4"):
         llm = langchain.chat_models.ChatOpenAI(
             temperature=temp,
@@ -29,6 +37,21 @@ def _make_llm(model, temp, api_key, streaming: bool = False):
             callbacks=[StreamingStdOutCallbackHandler()],
             openai_api_key=api_key,
         )
+    elif ollama_base_url:
+        # Any other model name is treated as a local Ollama model. Ollama's
+        # /v1 endpoint speaks the OpenAI chat-completions API, so the same
+        # ChatOpenAI client works unmodified as transport -- this avoids
+        # needing `ChatOllama`, which doesn't exist at this package's pinned
+        # langchain version.
+        llm = langchain.chat_models.ChatOpenAI(
+            temperature=temp,
+            model_name=model,
+            request_timeout=1000,
+            streaming=streaming,
+            callbacks=[StreamingStdOutCallbackHandler()],
+            openai_api_key=api_key or "ollama",
+            openai_api_base=ollama_base_url,
+        )
     else:
         raise ValueError(f"Invalid model name: {model}")
     return llm
@@ -38,8 +61,8 @@ class ChemCrow:
     def __init__(
         self,
         tools=None,
-        model="gpt-4-0613",
-        tools_model="gpt-3.5-turbo-0613",
+        model=CHEMCROW_MODEL,
+        tools_model=CHEMCROW_MODEL,
         temp=0.1,
         max_iterations=40,
         verbose=True,
@@ -47,18 +70,29 @@ class ChemCrow:
         openai_api_key: Optional[str] = None,
         api_keys: dict = {},
         local_rxn: bool = False,
+        ollama_base_url: Optional[str] = OLLAMA_BASE_URL,
     ):
-        """Initialize ChemCrow agent."""
+        """Initialize ChemCrow agent.
+
+        By default this runs entirely against a local Ollama model
+        (`CHEMCROW_MODEL`, served at `ollama_base_url`) and needs no OpenAI
+        API key. Pass a `gpt-*`/`text-*` model name (and `openai_api_key`)
+        to use OpenAI instead; pass `ollama_base_url=None` to disable the
+        Ollama fallback and get the original "Invalid model name" error for
+        unrecognized model strings.
+        """
 
         load_dotenv()
         try:
-            self.llm = _make_llm(model, temp, openai_api_key, streaming)
+            self.llm = _make_llm(model, temp, openai_api_key, streaming, ollama_base_url)
         except ValidationError:
             raise ValueError("Invalid OpenAI API key")
 
         if tools is None:
             api_keys["OPENAI_API_KEY"] = openai_api_key
-            tools_llm = _make_llm(tools_model, temp, openai_api_key, streaming)
+            tools_llm = _make_llm(
+                tools_model, temp, openai_api_key, streaming, ollama_base_url
+            )
             tools = make_tools(tools_llm, api_keys=api_keys, local_rxn=local_rxn, verbose=verbose)
 
         # Initialize agent
@@ -81,6 +115,6 @@ class ChemCrow:
 
         self.rephrase_chain = chains.LLMChain(prompt=rephrase, llm=self.llm)
 
-    def run(self, prompt):
-        outputs = self.agent_executor({"input": prompt})
+    def run(self, prompt, callbacks=None):
+        outputs = self.agent_executor({"input": prompt}, callbacks=callbacks)
         return outputs["output"]

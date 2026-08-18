@@ -30,11 +30,14 @@ setup(
         "nest_asyncio",
         "tiktoken",
         "rmrkl",
-        #"paper-scraper@git+https://github.com/blackadad/paper-scraper.git",
+        "paper-scraper@git+https://github.com/blackadad/paper-scraper.git",
         "streamlit",
         "rxn4chemistry",
         "duckduckgo-search",
         "wikipedia",
+        # tools/safety.py imports pkg_resources at runtime; modern setuptools
+        # (>=81) dropped it.
+        "setuptools<81",
     ],
     test_suite="tests",
     long_description=long_description,
