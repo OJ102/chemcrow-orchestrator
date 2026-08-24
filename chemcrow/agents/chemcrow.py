@@ -14,16 +14,25 @@ from .tools import make_tools
 # Local model served by Ollama, used by default. Ollama exposes an
 # OpenAI-compatible /v1 endpoint, so no OpenAI account/key is needed.
 #
-# qwen3.8:27b requires a newer Ollama server than the system-wide install at
-# /usr/local/bin/ollama (root-owned, no sudo available to upgrade it), so it
-# runs on a separate user-space Ollama daemon on port 11435 instead of the
-# default 11434 -- see /home3/jadhavor/ollama-local (binary + its own model
-# store). That daemon must be running for this to work; it is not a system
-# service, so it won't survive a reboot on its own. Start it with:
-#   OLLAMA_HOST=127.0.0.1:11435 OLLAMA_MODELS=/home3/jadhavor/ollama-local/models \
-#     /home3/jadhavor/ollama-local/extracted/bin/ollama serve
-CHEMCROW_MODEL = os.getenv("CHEMCROW_MODEL", "qwen3.8:27b")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435/v1")
+# Which model and which Ollama daemon (host:port) is a per-machine detail --
+# e.g. here, qwen3.8:27b needs a newer Ollama server than the system-wide
+# install (root-owned, no sudo to upgrade), so it actually runs on a second,
+# user-space daemon on a non-default port. That doesn't belong in version
+# control: it's read from ollama_local_config.py, which is gitignored (see
+# ollama_local_config.py.example for the template and setup notes). Highest
+# priority wins: CHEMCROW_MODEL/OLLAMA_BASE_URL env vars, then that local
+# config file, then the hardcoded fallback below.
+try:
+    from .ollama_local_config import CHEMCROW_MODEL as _LOCAL_MODEL
+    from .ollama_local_config import OLLAMA_BASE_URL as _LOCAL_BASE_URL
+except ImportError:
+    _LOCAL_MODEL = None
+    _LOCAL_BASE_URL = None
+
+CHEMCROW_MODEL = os.getenv("CHEMCROW_MODEL") or _LOCAL_MODEL or "qwen3.5:35b"
+OLLAMA_BASE_URL = (
+    os.getenv("OLLAMA_BASE_URL") or _LOCAL_BASE_URL or "http://localhost:11434/v1"
+)
 
 
 def _make_llm(

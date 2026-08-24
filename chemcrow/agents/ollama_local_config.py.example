@@ -1,0 +1,19 @@
+"""Template for chemcrow/agents/ollama_local_config.py (gitignored).
+
+Copy this file to `ollama_local_config.py` in the same directory and fill in
+values for your machine. That file is not tracked by git -- it's the place
+for machine-specific Ollama settings (which model, which port/daemon) that
+have no business being committed, since they differ per environment (and,
+here, per workaround -- see the comment in chemcrow.py about the user-space
+Ollama daemon).
+
+    cp ollama_local_config.py.example ollama_local_config.py
+    # then edit CHEMCROW_MODEL / OLLAMA_BASE_URL below
+
+Both values are optional -- chemcrow.py falls back to its own hardcoded
+defaults if this file doesn't exist or a value is left as None. Env vars
+CHEMCROW_MODEL / OLLAMA_BASE_URL, if set, win over everything here.
+"""
+
+CHEMCROW_MODEL = None  # e.g. "qwen3.8:27b"
+OLLAMA_BASE_URL = None  # e.g. "http://127.0.0.1:11435/v1"

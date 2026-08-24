@@ -132,6 +132,9 @@ local/
 *ipynb
 query/
 
+# Machine-specific Ollama settings (see ollama_local_config.py.example)
+chemcrow/agents/ollama_local_config.py
+
 # Models in docker directory
 **/docker/molecular-transformer/*txt
 *.pt
