@@ -8,6 +8,7 @@ not just at the end of the full agent run.
 Run with: streamlit run chemcrow/frontend/app.py
 """
 
+import re
 from typing import Optional
 
 import streamlit as st
@@ -28,6 +29,44 @@ DEFAULT_SMILES = "CC(=O)Oc1ccccc1C(=O)O"  # aspirin
 # ReactionRetrosynthesis is also excluded -- it returns a free-text recipe,
 # not a SMILES.
 CANVAS_DRIVING_TOOLS = {"ReactionPredict"}
+
+# Best-effort scan of the agent's final-answer text for a SMILES string.
+# Needed because there's no reaction tool wired up right now (ReactionPredict
+# needs a local Docker server on :8051 -- see chemcrow/tools/reactions.py)
+# that would drive CANVAS_DRIVING_TOOLS above; without a real tool to call,
+# the agent just states the modified molecule in prose, e.g. "...the
+# resulting SMILES is `CCO`." Highest-confidence patterns are tried first;
+# a plain token scan is the last resort.
+_SMILES_TOKEN = r"[A-Za-z0-9@+\-\[\]\(\)=#\\/%.]{3,}"
+_LABELED_SMILES_RE = re.compile(
+    rf"SMILES\s*(?:string)?\s*(?:is|:|=)\s*[`\"']?({_SMILES_TOKEN})[`\"']?",
+    re.IGNORECASE,
+)
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_TOKEN_RE = re.compile(_SMILES_TOKEN)
+
+
+def extract_smiles_from_text(text: str) -> Optional[str]:
+    """Find a SMILES string in free text, or None.
+
+    Not foolproof (a stray 3+ char token could coincidentally parse as a
+    single-atom SMILES) -- prefers text explicitly labeled "SMILES: ..." or
+    backtick-quoted, and only falls back to scanning all tokens (keeping the
+    last valid one, since the final answer usually states the result last)
+    if neither of those matches.
+    """
+    for pattern in (_LABELED_SMILES_RE, _BACKTICK_RE):
+        for match in pattern.finditer(text):
+            candidate = match.group(1).strip().strip(".,;")
+            if is_smiles(candidate):
+                return candidate
+
+    last_valid = None
+    for match in _TOKEN_RE.finditer(text):
+        candidate = match.group(0).strip(".,;")
+        if is_smiles(candidate):
+            last_valid = candidate
+    return last_valid
 
 
 class MoleculeCanvasCallback(BaseCallbackHandler):
@@ -127,6 +166,10 @@ def main() -> None:
                 )
                 try:
                     answer = st.session_state.agent.run(full_prompt, callbacks=[callback])
+                    new_smiles = extract_smiles_from_text(answer)
+                    if new_smiles and new_smiles != st.session_state.smiles:
+                        st.session_state.smiles = new_smiles
+                        render_molecule(new_smiles, img_slot, smiles_slot, metrics_slot)
                 except Exception as exc:  # keep the UI alive on agent errors
                     answer = f"Error running agent: {exc}"
                 status.update(label="Done", state="complete", expanded=False)
