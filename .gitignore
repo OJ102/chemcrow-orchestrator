@@ -141,3 +141,5 @@ chemcrow/agents/ollama_local_config.py
 *onnx
 **/docker/*/files/*csv.gz
 **/docker/*/files/*hdf5
+.venv-chemcrow/
+.venv-langgraph/

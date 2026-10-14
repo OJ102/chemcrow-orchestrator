@@ -1,0 +1,5 @@
+langgraph>=1.2
+langchain-core>=1.6
+pydantic>=2.13
+rdkit>=2026.9
+pytest>=9.1
