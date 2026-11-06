@@ -143,3 +143,8 @@ chemcrow/agents/ollama_local_config.py
 **/docker/*/files/*hdf5
 .venv-chemcrow/
 .venv-langgraph/
+# orchestrator run databases (run data, not code)
+runs/
+*.db
+*.db-wal
+*.db-shm

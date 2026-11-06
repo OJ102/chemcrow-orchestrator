@@ -1,111 +1,121 @@
-"""Tests for the gate and the graph. Run from the repo root:
+"""Tests for the whole loop (graph.py), using the fully controlled fakes in fakes.py.
 
+Run from the repo root, in the langgraph venv:
     python -m pytest orchestrator/tests -v
 
-The graph tests swap in tiny fake tools (ListGenerator, TablePredictor) so each
-test controls exactly which SMILES appear and what they score.
+Each test prepares the molecules the fake generator will hand out each round
+(`batches`) and which molecules get special predictions (`table`), runs the
+graph once with `run(...)`, then checks the final state.
+Reminder (fakes.py): GOOD -> Accept, OPAQUE -> Revise, UNSURE -> Escalate,
+FAILED -> failed prediction.
 """
 
-from langgraph.types import Command
+import pytest
+from pydantic import ValidationError
 
-from orchestrator import Candidate, Constraints, Prediction, Tools, build_graph
-from orchestrator.gate import evaluate, pareto_rank
-from orchestrator.stubs import StubRetriever
-
-# Reusable predictions. With default Constraints:
-GOOD = Prediction(pce=8.0, avt=0.6, homo=-5.4, lumo=-3.6, opv_prob=0.9, uncertainty=0.05)  # -> accept
-OPAQUE = GOOD.model_copy(update={"avt": 0.1})  # fails min_avt -> revise
-UNSURE = GOOD.model_copy(update={"uncertainty": 0.5})  # passes but too uncertain -> escalate
+from orchestrator import RunConfig
+from orchestrator.tests.fakes import CONSTRAINTS, FAILED, OPAQUE, UNSURE, FakeClock, run
 
 
-class ListGenerator:
-    """Yields one predetermined batch per call."""
-
-    def __init__(self, batches):
-        self.batches = iter(batches)  # each next() returns the following batch
-        self.feedback_seen = []  # records the feedback passed on each call, for assertions
-
-    def generate(self, constraints, feedback, n):
-        self.feedback_seen.append(feedback)
-        return next(self.batches)
+def ids(candidates):
+    """The candidate_ids of a list of candidates, e.g. ["it1-c01", "it1-c02"]. Makes asserts short."""
+    return [c.candidate_id for c in candidates]
 
 
-class TablePredictor:
-    """Looks up a prediction by SMILES; anything not in the table gets `default`."""
+# --- How a run ends -------------------------------------------------------------
 
-    def __init__(self, table, default=GOOD):
-        self.table, self.default = table, default
-
-    def predict(self, smiles, partner_smiles, target_type):
-        return self.table.get(smiles, self.default)
-
-
-def run(batches, table, default=GOOD, **constraint_kw):
-    """Build a graph with the fake tools and run it once.
-
-    Returns (graph, config, generator, result) so tests can inspect the
-    feedback the generator saw, or resume the same run after an interrupt.
-    """
-    gen = ListGenerator(batches)
-    graph = build_graph(Tools(StubRetriever(), gen, TablePredictor(table, default)))
-    config = {"configurable": {"thread_id": "t"}}
-    constraints = Constraints(target_type="donor", fixed_partner_smiles="c1ccsc1", **constraint_kw)
-    result = graph.invoke({"objective": "test", "constraints": constraints}, config)
-    return graph, config, gen, result
+def test_completes_when_nothing_is_left_to_revise():
+    """Three GOOD molecules in round 1: all accepted, nothing to revise -> completed after 1 round."""
+    _, result = run([["CCO", "CCN", "CCC"]])
+    assert result["status"] == "completed"
+    assert result["stop_reason"] == "no candidates left to revise"
+    assert result["iteration"] == 1 and len(result["ranked"]) == 3
 
 
-def test_gate_decisions():
-    """Each of the four verdicts comes from the right kind of input."""
-    c = Constraints(target_type="donor", fixed_partner_smiles="C")
-    assert evaluate(Candidate(smiles="x", iteration=1), c)[0] == "reject"
-    base = Candidate(smiles="C", iteration=1, valid=True)
-    assert evaluate(base.model_copy(update={"prediction": GOOD}), c) == ("accept", [])
-    decision, violations = evaluate(base.model_copy(update={"prediction": OPAQUE}), c)
-    assert decision == "revise" and violations[0].startswith("low_avt:")
-    assert evaluate(base.model_copy(update={"prediction": UNSURE}), c)[0] == "escalate"
+def test_revise_rounds_pass_parents_and_stop_at_the_iteration_budget():
+    """Every molecule is too dark (OPAQUE), so each round's candidate is revised in the next.
+    Checks: the parent reaches the generator WITH its machine-readable violation, the
+    new candidate records its parent (lineage), and the run stops after max_iterations (3)."""
+    gen, result = run([["c1ccccc1"], ["Cc1ccccc1"], ["CCc1ccccc1"]], default=OPAQUE)
+    assert gen.packets[0].parents == []  # round 1: invent from scratch
+    parent = gen.packets[1].parents[0]  # round 2 revises round 1's candidate
+    assert parent.candidate_id == "it1-c01"
+    assert parent.decision.violations[0].field == "avt_fraction"
+    assert result["history"][1].parent_candidate_id == "it1-c01"  # lineage recorded
+    assert result["status"] == "stopped"
+    assert result["stop_reason"] == "iteration budget (3) exhausted"
+    assert ids(result["near_misses"]) == ["it1-c01", "it2-c01", "it3-c01"]  # all kept (advisor)
 
 
-def test_pareto_rank_puts_nondominated_first():
-    """(3, 0.3) is beaten on both axes by (9, 0.4), so it must rank last."""
-    # mk builds a candidate with the given PCE and AVT.
-    mk = lambda pce, avt: Candidate(smiles=f"{pce}{avt}", iteration=1,
-                                     prediction=GOOD.model_copy(update={"pce": pce, "avt": avt}))
-    dominated, a, b = mk(3, 0.3), mk(9, 0.4), mk(4, 0.8)
-    ranked = pareto_rank([dominated, a, b])
-    assert ranked[-1] is dominated and set(map(id, ranked[:2])) == {id(a), id(b)}
+def test_all_predictions_failing_marks_the_run_failed():
+    _, result = run([["CCO"]], default=FAILED)
+    assert result["status"] == "failed"
 
 
-def test_accepts_and_finishes():
-    """Three good molecules in one batch meet target_count -> status "done"."""
-    *_, result = run([["CCO", "CCN", "CCC"]], {}, target_count=3)
-    assert result["status"] == "done"
-    assert len(result["ranked"]) == 3
+def test_runtime_budget_stops_the_run():
+    """A fake clock where every step appears to take 1,000 s of WORK. Round 1 alone
+    is 6 steps = 6,000 s, more than the 1,800 s budget. The run would otherwise
+    revise again, but runs out of time after round 1."""
+    _, result = run([["c1ccccc1"], ["Cc1ccccc1"]], default=OPAQUE, clock=FakeClock(step=1000))
+    assert result["status"] == "stopped" and "runtime budget" in result["stop_reason"]
+    assert result["iteration"] == 1
+    # 7 timed steps: start, retrieve, generate, validate, predict, decide, finish.
+    assert result["active_seconds"] == 7000
 
 
-def test_revise_loop_passes_feedback_then_stops_on_budget():
-    """Failures become feedback for the next round; the loop stops at max_iterations."""
-    batches = [["c1ccccc1"], ["Cc1ccccc1"], ["CCc1ccccc1"]]
-    _, _, gen, result = run(batches, {}, default=OPAQUE, max_iterations=3, patience=10)
-    assert result["status"] == "stopped" and "iteration budget" in result["stop_reason"]
-    assert gen.feedback_seen[0] == []
-    assert gen.feedback_seen[1] == ["low_avt: 1/1 candidates"]
+# --- Escalate = set aside -------------------------------------------------------
+
+def test_escalated_candidates_are_set_aside_and_the_run_finishes():
+    """CCN is too uncertain -> set aside (not shortlisted), and the run does NOT pause."""
+    _, result = run([["CCO", "CCN"]], table={"CCN": UNSURE})
+    assert "__interrupt__" not in result  # this key would appear if the graph had paused
+    assert result["status"] == "completed"
+    assert ids(result["escalated"]) == ["it1-c02"]
+    assert ids(result["ranked"]) == ["it1-c01"]  # only CCO is on the shortlist
 
 
-def test_invalid_and_duplicate_are_rejected():
-    """OCC is ethanol, same as CCO, so it's a duplicate; garbage SMILES is invalid."""
-    *_, result = run([["CCO", "OCC", "not_a_smiles"]], {}, target_count=5, max_iterations=1)
-    decisions = [c.decision for c in result["history"]]
-    assert decisions == ["accept", "reject", "reject"]
-    assert result["history"][1].violations[0].startswith("duplicate:")
+# --- Our validate safety net, and failed predictions ------------------------------
+
+def test_validate_catches_invalid_and_duplicate_molecules():
+    """"OCC" is ethanol again (same pair as "CCO"); "not_a_smiles" isn't a molecule.
+    Both are logged with a ChemistryViolation and never reach the predictor."""
+    _, result = run([["CCO", "OCC", "not_a_smiles"]])
+    codes = {c.candidate_id: [v.check_code for v in c.chemistry_violations] for c in result["history"]}
+    assert codes == {"it1-c01": [], "it1-c02": ["duplicate_pair"], "it1-c03": ["invalid_smiles"]}
+    assert result["history"][1].prediction is None  # never predicted
 
 
-def test_escalation_interrupts_and_resumes():
-    """An uncertain candidate pauses the run; approving it on resume accepts it."""
-    graph, config, _, result = run([["CCO", "CCN"]], {"CCN": UNSURE}, target_count=2)
-    assert "__interrupt__" in result
-    pending = result["__interrupt__"][0].value["candidates"]
-    assert [c["canonical_smiles"] for c in pending] == ["CCN"]
+def test_a_failed_prediction_is_logged_and_the_rest_continue():
+    _, result = run([["CCO", "CCN"]], table={"CCN": FAILED})
+    assert ids(result["failed_predictions"]) == ["it1-c02"]
+    assert ids(result["ranked"]) == ["it1-c01"] and result["status"] == "completed"
 
-    result = graph.invoke(Command(resume={"approve": ["CCN"]}), config)
-    assert result["status"] == "done"
-    assert {c.canonical_smiles for c in result["ranked"]} == {"CCO", "CCN"}
+
+# --- The optional extra stop rules (our addition) ---------------------------------
+
+def test_optional_rules_are_off_by_default():
+    config = RunConfig(target_type="donor", fixed_partner_smiles="C", constraints=CONSTRAINTS)
+    assert config.target_count is None and config.patience is None
+
+
+def test_target_count_finishes_early():
+    """Benzene needs revising, but 1 accepted (CCO) already meets target_count=1."""
+    _, result = run([["c1ccccc1", "CCO"]], table={"c1ccccc1": OPAQUE}, target_count=1)
+    assert result["status"] == "completed" and "target count" in result["stop_reason"]
+
+
+def test_patience_stops_when_there_is_no_near_miss_progress():
+    """Round 2's near miss is exactly as far short as round 1's (formula NM-4: no
+    progress). With patience=1, one round without progress stops the run."""
+    _, result = run([["c1ccccc1"], ["Cc1ccccc1"]], default=OPAQUE, patience=1, max_iterations=5)
+    assert result["status"] == "stopped"
+    assert result["stop_reason"] == "no near-miss progress for 1 iterations"
+
+
+# --- Run settings are checked up front ----------------------------------------------
+
+def test_an_invalid_fixed_partner_is_rejected():
+    """If the partner isn't a real molecule, every pair would be invalid, so refuse the run.
+    pytest.raises(X) means "the code inside this block MUST raise error X"."""
+    with pytest.raises(ValidationError):
+        RunConfig(target_type="donor", fixed_partner_smiles="not_a_smiles", constraints=CONSTRAINTS)
