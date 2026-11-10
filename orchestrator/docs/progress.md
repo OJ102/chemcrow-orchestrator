@@ -123,7 +123,14 @@ spec in many places and must be reshaped before real tools are connected.
 
 ## Log
 
-### 2026-11-10 (latest): SynSpace / ModifyMol test on real OPV molecules
+### 2026-11-10 (latest): Run guide; push access
+- **`docs/running.md`** (new): step by step for the tests, demo, saved runs,
+  API + worker (with a ready-to-paste `POST /runs` body) and the SynSpace
+  check, with real captured output and how to read and explain each line.
+  Linked from the README and HANDOFF.
+- Shashank now has push access to `OJ102/chemcrow-orchestrator`.
+
+### 2026-11-10 (evening): SynSpace / ModifyMol test on real OPV molecules
 **Question:** can SynSpace (`synspace` 1.0.0, MIT; the library behind ChemCrow's
 ModifyMol tool) make small, synthesizable variants of our molecules, so we could
 use it to "repair" near misses?
@@ -170,8 +177,8 @@ Every run finished in 3–6 s with no crashes, and every variant was valid to RD
 the near-miss repair tool. Tell Jaxon the result. OPV repair needs OPV-specific
 edits (halogenation, end-group swaps, side-chain length, core/π-bridge swaps),
 done by MatGPT with structured repair instructions or by a small OPV edit
-library. The test script and results were throwaway files in the session scratchpad.
-
+library. The test script is kept as `experiments/check_synspace.py` (run it
+with `.venv-synspace`; see [running.md §6](running.md#6-the-synspace-modifymol-check)).
 ### 2026-11-10 (later): Item 6 done: retries, failure codes, audit log
 Decisions Q1–Q7 (all as recommended, Shashank 2026-11-10):
 - **Retries** (`retry.py`, new): every tool call (retriever, generator,

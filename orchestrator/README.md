@@ -14,7 +14,9 @@ ranked shortlist. It follows the team design documents D1 and D2.
 > failures get **specific codes**, and every run leaves an **audit trail**. The
 > retriever, generator and predictor are **fakes that produce made-up numbers**,
 > and the gate and ranker are **placeholders** written to D2's rules. Items 4–6
-> are done; next is testing SynSpace (ModifyMol). See [docs/progress.md](docs/progress.md).
+> are done. SynSpace (ChemCrow's ModifyMol) was tested and found unsuitable for
+> OPV near-miss repair; next is re-implementing useful ChemCrow screens. See
+> [docs/progress.md](docs/progress.md).
 
 ## Documentation
 
@@ -22,6 +24,7 @@ ranked shortlist. It follows the team design documents D1 and D2.
 |---|---|
 | This README | What the package is, how to set up and run it |
 | [docs/HANDOFF.md](docs/HANDOFF.md) | **Continuing in a new session?** Project state, decisions, open questions and next steps on one page |
+| [docs/running.md](docs/running.md) | **Step by step:** run the tests, demo, API + worker and the SynSpace check, and how to read and explain every line of output |
 | [docs/primer.md](docs/primer.md) | **Start here if you're new:** chemistry words, Python features, LangGraph, and tests explained from zero |
 | [docs/spec-alignment.md](docs/spec-alignment.md) | What the team design docs (D0/D1/D2) require from the orchestrator, and where the code stands |
 | [docs/chemcrow-tools.md](docs/chemcrow-tools.md) | ChemCrow's 19 tools: what each does, whether it fits, and where it would plug into the loop |
@@ -201,6 +204,12 @@ disk), as well as to the screen.
 `DEPENDENCY_UNAVAILABLE` (a tool kept failing temporarily, all 3 attempts used),
 `TOOL_ERROR` (a tool failed permanently), `ALL_PREDICTIONS_FAILED`,
 `UNKNOWN_POLICY`, or `INTERNAL_ERROR` (a bug in our code: check the log files).
+
+### 7. The SynSpace (ModifyMol) experiment
+
+A one-off check, outside this package, in `experiments/check_synspace.py`. It
+uses its own throwaway venv, `.venv-synspace`. See
+[docs/running.md §6](docs/running.md#6-the-synspace-modifymol-check) for how to run it and read its output.
 
 ### Without activating anything
 

@@ -149,3 +149,4 @@ runs/
 *.db-wal
 *.db-shm
 .venv-synspace/
+experiments/output/

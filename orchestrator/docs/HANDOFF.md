@@ -70,9 +70,12 @@ Matters; expert for borderline candidates).
     auto-activate the chemcrow venv: check with `python -c "import sys; print(sys.prefix)"`.
 - **Git:** branch `shashank/langgraph-orchestration`. Commits on top of `main`:
   `1552297` baseline → `1d5a981` spec reshape + saving to disk → `b9b3532` web
-  API + worker → `b315559` retries + audit log. **Not pushed**: Shashank's
-  account had no push access to `OJ102/chemcrow-orchestrator` (needs
-  collaborator access from Om, or a fork).
+  API + worker → `b315559` retries + audit log → `6276a65` handoff + SynSpace
+  results → run guide. Shashank now **has push access** to
+  `OJ102/chemcrow-orchestrator` (2026-11-10).
+- **Step-by-step run guide** (tests, demo, API, SynSpace, reading the output):
+  [running.md](running.md). The SynSpace experiment lives in
+  `experiments/check_synspace.py` (venv `.venv-synspace`).
 
 ### `orchestrator/` package
 ```
@@ -91,7 +94,7 @@ retry.py       D2 retry rules for every tool call
 logs.py        rotating operational logs (runs/logs/)
 __main__.py    demo + `serve` and `worker` commands
 tests/         82 tests (fakes.py + test_gate/near_miss/graph/storage/worker/api/retry/audit)
-docs/          primer, code-guide, spec-alignment, chemcrow-tools, progress, HANDOFF (this file)
+docs/          running (how to run + read output), primer, code-guide, spec-alignment, chemcrow-tools, progress, HANDOFF (this file)
 ```
 
 ### How to run
