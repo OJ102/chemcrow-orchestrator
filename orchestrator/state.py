@@ -215,6 +215,13 @@ class Policy(BaseModel):
     # Any value listed here whose uncertainty is unknown or bigger -> Escalate (D2).
     uncertainty_max_by_target: dict[ValueName, float]
     max_runtime_seconds: int = Field(default=1800, gt=0)  # whole-run time budget. D2 proposes 30 min.
+    # D2's per-call deadlines, in seconds: how long one generator or predictor call
+    # may take. STORED but NOT ENFORCED yet (decision Q3, 2026-11-10): stopping a
+    # Python call that's still running is unreliable, so each real tool's
+    # connection code will enforce its deadline as a network timeout, and a
+    # timeout then counts as a temporary error (retried, see retry.py).
+    deadlines_seconds: dict[str, float] = Field(
+        default_factory=lambda: {"generation": 120.0, "prediction": 120.0})
 
 
 # ============================================================================

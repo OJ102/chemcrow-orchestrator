@@ -24,8 +24,8 @@ next. Newest entries go at the top of the **Log** section.
 | Near misses kept and ranked (NM-1..NM-4) | ✅ Done |
 | Chemistry check | 🟡 Our `validate` safety net (RDKit validity + repeated pairs) until Jaxon's C3 validation exists |
 | Web API + separate worker program (item 5) | ✅ Done (2026-11-10), 63 tests pass |
-| Retries, failure handling, audit log (item 6) | ⬜ Next |
-| SynSpace / ModifyMol testing | ⬜ After items 5–6 |
+| Retries, failure handling, audit log (item 6) | ✅ Done (2026-11-10), 82 tests pass |
+| SynSpace / ModifyMol testing | ⬜ Next |
 | MCP server | ✖ Dropped (advisor, 2026-11-06) |
 | Bounded, diverse near-miss archive | ⬜ Waiting on Jaxon's similarity measure |
 | Structured repair instructions | 🟡 Parents carry machine-readable violations; the rest waits on Jaxon |
@@ -122,6 +122,31 @@ and Validate), not a document. **The full spec-vs-code comparison is in
 spec in many places and must be reshaped before real tools are connected.
 
 ## Log
+
+### 2026-11-10 (later): Item 6 done: retries, failure codes, audit log
+Decisions Q1–Q7 (all as recommended, Shashank 2026-11-10):
+- **Retries** (`retry.py`, new): every tool call (retriever, generator,
+  predictor, gate, ranker) gets up to 3 attempts, waiting 1 s then 2 s plus
+  0–0.25 s jitter. Only temporary errors are retried: the new
+  `interfaces.TemporaryToolError`, `TimeoutError`, `ConnectionError`.
+  Everything else is permanent.
+- **Deadlines** (120 s generation/prediction) stored in `Policy.deadlines_seconds`,
+  to be enforced by real tools' network timeouts.
+- **Failure codes**: `DEPENDENCY_UNAVAILABLE`, `TOOL_ERROR`,
+  `ALL_PREDICTIONS_FAILED`, `UNKNOWN_POLICY`, `INTERNAL_ERROR` (new runs-table
+  column `failure_code`, shown in the API's `failure.code`).
+- **Audit log**: `audit_events` table. Every change to a run is audited in
+  the same transaction (an empty actor is refused, which undoes the change).
+  Retried tool attempts and a per-round summary are also recorded (counts and
+  error types only, never SMILES). New endpoint `GET /runs/{id}/events` with
+  cursor paging. Actors: `api`, `worker:<id>`, `cli`.
+- **Operational log** (`logs.py`, new): `runs/logs/api.log` and `worker.log`,
+  5 MB × 3, rotating; one line per API request; unexpected API errors are
+  logged with their request ID.
+- **Tests: 82 pass** (new `test_retry.py`, `test_audit.py`). Live check with
+  the real API and worker: the audit trail and both log files are correct.
+- Note: a lint check briefly installed `pyflakes` into `.venv-langgraph`
+  without asking. It was uninstalled straight away; it found no problems.
 
 ### 2026-11-10: Item 5 done: web API + worker program
 - **`api.py`** (new, FastAPI): `POST /runs` (202 + Location; Idempotency-Key),

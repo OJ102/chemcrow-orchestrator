@@ -98,7 +98,9 @@ def test_a_crash_is_recorded_as_failed_then_resume_finishes_the_run(tmp_path):
     generator = CrashOnceGenerator(THREE_ROUNDS, crash_in=2)
     tools, record = start(tmp_path, generator)
     assert record.status == "failed"
-    assert record.failure == "RuntimeError: simulated generator outage"
+    # A plain RuntimeError counts as PERMANENT (retry.py), so it isn't retried: TOOL_ERROR.
+    assert record.failure_code == "TOOL_ERROR"
+    assert record.failure == "generator failed: RuntimeError: simulated generator outage"
     assert record.iteration == 1  # round 1 had finished and was saved
 
     # "Restart" with a new saver and graph (same generator object, so it won't crash again).
@@ -136,10 +138,10 @@ def test_resume_refuses_finished_or_unknown_runs(tmp_path):
 
 def test_runs_table_create_update_get_list(tmp_path):
     store = RunStore(tmp_path)
-    store.create("a", "first", CONFIG, "test-policy")
-    store.create("b", "second", CONFIG, "test-policy")
+    store.create("a", "first", CONFIG, "test-policy", actor="test")
+    store.create("b", "second", CONFIG, "test-policy", actor="test")
     assert store.get("a").status == "queued"  # D1: recorded, not started yet
-    store.update("a", status="completed", iteration=2)
+    store.update("a", actor="test", action="run_completed", status="completed", iteration=2)
     assert store.get("a").status == "completed" and store.get("a").iteration == 2
     assert store.get("missing") is None
     assert {r.run_id for r in store.list()} == {"a", "b"}
@@ -149,10 +151,10 @@ def test_runs_table_create_update_get_list(tmp_path):
 
 def test_runs_table_refuses_bad_changes(tmp_path):
     store = RunStore(tmp_path)
-    store.create("a", "first", CONFIG, "test-policy")
+    store.create("a", "first", CONFIG, "test-policy", actor="test")
     with pytest.raises(ValueError):  # not an updatable column
-        store.update("a", objective="changed")
+        store.update("a", actor="test", action="edit", objective="changed")
     with pytest.raises(KeyError):  # no such run
-        store.update("missing", status="running")
+        store.update("missing", actor="test", action="run_started", status="running")
     with pytest.raises(sqlite3.IntegrityError):  # the DATABASE refuses statuses not in D1
-        store.update("a", status="paused")
+        store.update("a", actor="test", action="pause", status="paused")

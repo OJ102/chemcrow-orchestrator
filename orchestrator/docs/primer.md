@@ -207,7 +207,7 @@ ID and also LangGraph's `thread_id`.
 try:
     final = graph.invoke(inputs, config)
 except Exception as error:
-    store.update(run_id, status="failed", failure=str(error))
+    store.update(run_id, actor="cli", action="run_failed", status="failed", failure=str(error))
 ```
 Run the `try` block. If anything inside raises an error, jump to `except`
 instead of crashing, with the error in the variable `error`. `runner.py`
@@ -340,6 +340,13 @@ code, a test fails and tells them immediately.
 | **Heartbeat** | The worker writing "still working on it" every few seconds. A run whose heartbeat has gone quiet (60 s) belonged to a crashed worker and can be taken over |
 | **Thread** | A second line of work inside one program. The heartbeat runs in its own thread while the run works. One database connection must not be shared by two threads at once, so each thread opens its own |
 | **`tmux`** | A Linux tool that keeps a terminal session running after you disconnect from the cluster |
+| **Retry** | Calling a tool again after it failed. D2: at most 3 attempts in total, waiting 1 s, then 2 s |
+| **Temporary vs permanent error** | Temporary = might work if you try again (server busy, network hiccup, timeout): retried. Permanent = will fail the same way every time (invalid input, a bug): never retried |
+| **Jitter** | A small random extra wait (0–0.25 s) added to each retry, so many callers retrying at once don't all hit a busy server at the same instant |
+| **Audit log** | The official record of what happened to each run: who (actor), what (action), how it went (result code), when. Saved in the same transaction as the change, so it can't be missing. Never contains SMILES |
+| **Operational log** | Diagnostic messages for whoever runs the programs (`runs/logs/*.log`). Size-limited files that *rotate*: when one is full, it's renamed and a new one starts, and the oldest is deleted |
+| **Failure code** | A short label for *why* a run failed, e.g. `DEPENDENCY_UNAVAILABLE`, so a dashboard can show it |
+| **Cursor (paging)** | A bookmark for long lists: the API returns one page plus a `next_cursor`; send it back to get the next page |
 
 The flow, end to end:
 ```

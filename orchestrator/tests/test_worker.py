@@ -12,6 +12,7 @@ import time
 
 from orchestrator import Tools, build_graph
 from orchestrator.gate import PlaceholderGate, PlaceholderRanker
+from orchestrator.retry import ToolFailed
 from orchestrator.runner import run_claimed, saved_state
 from orchestrator.storage import RunStore, make_checkpointer
 from orchestrator.stubs import StubRetriever
@@ -36,14 +37,17 @@ def make_worker(tmp_path, generator, default=OPAQUE):
                   predictor=TablePredictor({}, default),
                   gate=PlaceholderGate(), ranker=PlaceholderRanker())
     graph = build_graph(tools, checkpointer=make_checkpointer(tmp_path), clock=FakeClock(),
-                        should_cancel=store.is_cancel_requested)
+                        should_cancel=store.is_cancel_requested,
+                        # audit events from inside the run, as the real worker command records them
+                        on_event=lambda run_id, **event: store.record_event(run_id, actor="worker:w-test", **event),
+                        sleep=lambda seconds: None)  # retries don't really wait in tests
     return store, Worker(graph, store, policies=TEST_POLICIES, worker_id="w-test",
                          heartbeat_every=0.05)
 
 
 def queue(store: RunStore, run_id: str, policy_version: str = POLICY.policy_version):
     """Record a queued run, as the web API would."""
-    return store.create(run_id, "test", CONFIG, policy_version)
+    return store.create(run_id, "test", CONFIG, policy_version, actor="api")
 
 
 # --- Basic work ------------------------------------------------------------------------
@@ -91,7 +95,7 @@ class CancelInRound(ListGenerator):
 
     def generate_validate(self, packet):
         if packet.iteration == self.n:
-            self.store.request_cancel(self.run_id)
+            self.store.request_cancel(self.run_id, actor="api")
         return super().generate_validate(packet)
 
 
@@ -111,7 +115,7 @@ def test_cancel_stops_the_run_before_its_next_step_and_keeps_earlier_work(tmp_pa
 def test_cancelling_a_queued_run_stops_it_without_a_worker(tmp_path):
     store, worker = make_worker(tmp_path, ListGenerator([]))
     queue(store, "r1")
-    record = store.request_cancel("r1")
+    record = store.request_cancel("r1", actor="api")
     assert record.status == "stopped" and record.stop_reason == "cancelled"
     assert worker.process_next_run() is None  # nothing left to claim
 
@@ -134,7 +138,7 @@ def test_a_stale_run_is_taken_over_and_resumed(tmp_path):
     try:
         dead_graph.invoke({"run_id": "r1", "objective": "test", "config": CONFIG, "policy": POLICY},
                           {"configurable": {"thread_id": "r1"}})
-    except RuntimeError:
+    except ToolFailed:  # the generator's error, as the retry rules report it
         pass  # the "crash"; the dead worker never got to record it
     with store.conn:  # its last heartbeat was long ago
         store.conn.execute("UPDATE runs SET heartbeat_at = '2000-01-01T00:00:00+00:00' WHERE run_id = 'r1'")
@@ -167,5 +171,6 @@ def test_a_worker_that_lost_the_run_does_not_overwrite_its_status(tmp_path):
     store, worker = make_worker(tmp_path, ListGenerator(THREE_ROUNDS))
     queue(store, "r1")
     record = store.claim_next("w-test")
-    after = run_claimed(worker.graph, store, record, POLICY, still_owner=lambda: False)
+    after = run_claimed(worker.graph, store, record, POLICY, actor="worker:w-test",
+                        still_owner=lambda: False)
     assert after.status == "running"  # untouched: not "stopped"

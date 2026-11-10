@@ -7,7 +7,8 @@ them. This file keeps them in SQLite DATABASE FILES on disk, so a run can be:
   - looked up later by its run_id (Nyla's dashboard, via the web API),
   - RESUMED after a crash from the last step that finished,
   - picked up by the separate WORKER program (worker.py), which runs the
-    queued runs the web API (api.py) has recorded.
+    queued runs the web API (api.py) has recorded,
+  - AUDITED: every important event is recorded (item 6, D2's G4).
 
 SQLite = a small database stored in ONE ordinary file. Python can use it
 directly (the built-in `sqlite3` module); no database server is needed. Inside
@@ -18,10 +19,11 @@ TWO FILES (decision, 2026-11-06; D2 describes a single store, we chose two):
                    (OPVState) after EVERY step. Used to resume a run. Its
                    internal format belongs to LangGraph; we don't read it directly.
   runs.db        - OUR tables:
-                     runs     one row per run, with D1's "Run" fields plus what
-                              the worker needs (claim, heartbeat, cancel request)
-                     receipts idempotency receipts for POST requests (D1)
-                     workers  when each worker program was last seen
+                     runs         one row per run, with D1's "Run" fields plus what
+                                  the worker needs (claim, heartbeat, cancel request)
+                     receipts     idempotency receipts for POST requests (D1)
+                     workers      when each worker program was last seen
+                     audit_events the audit log (D2 G4): who did what, when
 
 Both files go in one folder (default "runs/", ignored by git). The folder is
 configurable, so later it can point at the shared server Nyla can reach.
@@ -34,6 +36,13 @@ HOW THE API AND THE WORKER SHARE WORK (they never talk directly, only through ru
   4. API: request_cancel() sets a flag; the worker checks it between steps
   5. Worker: claim_stale() takes over a "running" run whose heartbeat stopped
      (its worker crashed) and resumes it
+
+THE AUDIT LOG (decisions Q4/Q5, 2026-11-10): every change to a run is recorded
+in audit_events IN THE SAME TRANSACTION as the change itself. So if the audit
+record can't be saved, the change doesn't happen either (D2: "inability to
+save required audit fails the write"). Every change method therefore asks WHO
+is making it (`actor`, e.g. "api" or "worker:<id>"). Audit records never
+contain SMILES text, tokens or secrets (D2), only short codes and counts.
 
 WHAT IS STILL DEFERRED: D2's full leases with fencing tokens. The heartbeat
 and the "claimed_by" check are a lighter version, enough for one worker
@@ -58,6 +67,9 @@ from datetime import datetime, timedelta, timezone
 # Path: a tidy way to work with file and folder paths.
 from pathlib import Path
 from typing import Optional
+
+# uuid4: a unique ID for each audit event.
+from uuid import uuid4
 
 # The SQLite auto-save from the langgraph-checkpoint-sqlite package (installed 2026-11-06).
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -94,7 +106,8 @@ ALLOWED_STATE_CLASSES: list[tuple[str, str]] = [
 def _connect(path: Path) -> sqlite3.Connection:
     """Open (or create) a SQLite database file with the settings D2 asks for.
 
-      foreign_keys=ON      - SQLite enforces links between tables (off by default)
+      foreign_keys=ON      - SQLite enforces links between tables (off by default):
+                             e.g. an audit event must belong to a run that exists
       journal_mode=WAL     - "write-ahead log": readers don't block while a run is
                              writing, so the dashboard can read a run while it works
       busy_timeout=5000    - if the file is busy (e.g. the API and the worker write
@@ -102,7 +115,7 @@ def _connect(path: Path) -> sqlite3.Connection:
                              of failing immediately (D2's 5-second busy timeout)
 
     check_same_thread=False lets the connection be used from more than one
-    thread; the web server answers requests on several threads.
+    thread (one at a time); the worker's steps may run on a helper thread.
     """
     path.parent.mkdir(parents=True, exist_ok=True)  # create the folder if it doesn't exist
     conn = sqlite3.connect(path, check_same_thread=False)
@@ -171,18 +184,21 @@ class RunRecord(BaseModel):
     updated_at: str  # when this row last changed (UTC ISO 8601)
     stop_reason: Optional[str] = None  # why it ended, once it has
     failure: Optional[str] = None  # the error message, only for failed runs (D1)
+    # Why it failed, as a short code (decision Q7): DEPENDENCY_UNAVAILABLE,
+    # TOOL_ERROR, ALL_PREDICTIONS_FAILED, UNKNOWN_POLICY or INTERNAL_ERROR.
+    failure_code: Optional[str] = None
     cancel_requested: bool = False  # set by POST /runs/{id}/cancel; the worker checks it between steps
     claimed_by: Optional[str] = None  # which worker is running it (None while queued)
     heartbeat_at: Optional[str] = None  # when that worker last said "still working on it"
 
 
 class RunStore:
-    """Our tables in runs_dir/runs.db: runs, idempotency receipts, workers.
+    """Our tables in runs_dir/runs.db: runs, receipts, workers, audit_events.
 
     Example:
         store = RunStore()
-        store.create("abc-123", "find a donor for Y6", config, "placeholder-0")
-        store.update("abc-123", status="running")
+        store.create("abc-123", "find a donor for Y6", config, "placeholder-0", actor="cli")
+        store.update("abc-123", actor="cli", action="run_started", status="running")
         store.get("abc-123").status   ->  "running"
     """
 
@@ -229,9 +245,38 @@ class RunStore:
             last_seen_at TEXT NOT NULL
         )
         """,
+        # The AUDIT LOG (D2 G4's AuditEvent, plus `seq` and `detail`):
+        #   seq          - a number that only ever goes up (AUTOINCREMENT): the
+        #                  reliable ORDER of events. D2: timestamps alone don't order
+        #                  events (two can share the same second).
+        #   event_id     - the event's unique ID (D2)
+        #   run_id       - the run it's about. REFERENCES runs = it must be a real run
+        #                  (a "foreign key", enforced because foreign_keys is ON)
+        #   request_id   - the web request that caused it, if any
+        #   actor_id     - WHO did it: "api", "worker:<id>", "cli". CHECK: never empty (D2)
+        #   action       - WHAT happened, e.g. "run_created", "tool_attempt"
+        #   result_code  - HOW it went, e.g. "ok", "temporary_error", "TOOL_ERROR"
+        #   phase        - WHERE: a step or tool name, e.g. "generator"
+        #   attempt      - which attempt (for retried tool calls)
+        #   detail       - short extra info: codes and counts only, NEVER SMILES (D2)
+        """
+        CREATE TABLE IF NOT EXISTS audit_events (
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id    TEXT NOT NULL UNIQUE,
+            run_id      TEXT REFERENCES runs (run_id),
+            request_id  TEXT,
+            actor_id    TEXT NOT NULL CHECK (actor_id <> ''),
+            action      TEXT NOT NULL,
+            result_code TEXT NOT NULL,
+            phase       TEXT,
+            attempt     INTEGER,
+            detail      TEXT,
+            created_at  TEXT NOT NULL
+        )
+        """,
     ]
-    # Columns added to the runs table AFTER item 4 (2026-11-09). A runs.db made
-    # by item 4 doesn't have them, so __init__ adds any that are missing
+    # Columns added to the runs table AFTER item 4 (2026-11-09 and 2026-11-10). A
+    # runs.db made earlier doesn't have them, so __init__ adds any that are missing
     # (a "migration": updating an old database to the new layout without losing data).
     _ADDED_RUN_COLUMNS = {
         "knowledge_snapshot_id": "TEXT",
@@ -239,11 +284,12 @@ class RunStore:
         "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
         "claimed_by": "TEXT",
         "heartbeat_at": "TEXT",
+        "failure_code": "TEXT",
     }
     # The columns update() is allowed to change. Anything else is refused, so a
     # typo can't silently write into the wrong place. (Claiming, heartbeats and
     # cancelling have their own methods below.)
-    _UPDATABLE = {"status", "iteration", "stop_reason", "failure"}
+    _UPDATABLE = {"status", "iteration", "stop_reason", "failure", "failure_code"}
 
     def __init__(self, runs_dir: Path = DEFAULT_RUNS_DIR):
         # Remember the folder, so another thread can open its OWN connection to the
@@ -267,16 +313,55 @@ class RunStore:
         self.conn.close()
 
     # ------------------------------------------------------------------------
+    # The audit log
+    # ------------------------------------------------------------------------
+
+    def _audit(self, run_id: Optional[str], *, actor: str, action: str, result_code: str = "ok",
+               request_id: Optional[str] = None, phase: Optional[str] = None,
+               attempt: Optional[int] = None, detail: Optional[str] = None) -> None:
+        """Write one audit event. Called INSIDE the caller's transaction (`with self.conn:`),
+        so the event and the change it describes are saved together, or not at all.
+
+        An empty actor is refused (by the database's CHECK rule): D2 says an audit
+        event without an actor is rejected, and that also undoes the change.
+        """
+        self.conn.execute(
+            "INSERT INTO audit_events (event_id, run_id, request_id, actor_id, action, result_code, "
+            "phase, attempt, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid4()), run_id, request_id, actor, action, result_code, phase, attempt, detail, _now()))
+
+    def record_event(self, run_id: str, *, actor: str, action: str, result_code: str = "ok",
+                     request_id: Optional[str] = None, phase: Optional[str] = None,
+                     attempt: Optional[int] = None, detail: Optional[str] = None) -> None:
+        """Write an audit event on its own (for events that aren't a change to the runs
+        table, e.g. a retried tool call or a finished round)."""
+        with self.conn:
+            self._audit(run_id, actor=actor, action=action, result_code=result_code,
+                        request_id=request_id, phase=phase, attempt=attempt, detail=detail)
+
+    def list_events(self, run_id: str, limit: int = 50, after_seq: int = 0) -> list[dict]:
+        """A run's audit events in order, one page at a time.
+
+        after_seq: only events after this position (the "cursor" from the previous
+        page; 0 = from the start). Returns plain dictionaries, oldest first.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM audit_events WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+            (run_id, after_seq, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------------
     # Creating, changing and reading runs
     # ------------------------------------------------------------------------
 
     def create(self, run_id: str, objective: str, config: RunConfig, policy_version: str,
-               knowledge_snapshot_id: Optional[str] = None,
-               model_version: Optional[str] = None) -> RunRecord:
-        """Add a new run with status "queued" (D1: recorded, not started yet)."""
+               knowledge_snapshot_id: Optional[str] = None, model_version: Optional[str] = None,
+               *, actor: str, request_id: Optional[str] = None) -> RunRecord:
+        """Add a new run with status "queued" (D1: recorded, not started yet). Audited."""
         with self.conn:
             self._insert_run(run_id, objective, config, policy_version,
                              knowledge_snapshot_id, model_version)
+            self._audit(run_id, actor=actor, action="run_created", request_id=request_id)
         return self.get(run_id)
 
     def _insert_run(self, run_id, objective, config, policy_version,
@@ -297,12 +382,18 @@ class RunStore:
              knowledge_snapshot_id, model_version, now, now),
         )
 
-    def update(self, run_id: str, **changes) -> RunRecord:
-        """Change some columns of a run, e.g. update(run_id, status="running").
+    def update(self, run_id: str, *, actor: str, action: str, result_code: str = "ok",
+               request_id: Optional[str] = None, detail: Optional[str] = None,
+               **changes) -> RunRecord:
+        """Change some columns of a run AND record why, in one transaction.
+
+        Example: update(run_id, actor="worker:w1", action="run_started", status="running")
+        Every change needs an `action` (what happened) and an `actor` (who), so
+        every change to a run appears in the audit log.
 
         Also refreshes updated_at. Raises KeyError if the run doesn't exist, and
         ValueError if asked to change a column that isn't allowed.
-        (**changes collects the name=value arguments into a dictionary.)
+        (**changes collects the remaining name=value arguments into a dictionary.)
         """
         bad = set(changes) - self._UPDATABLE  # names that aren't allowed
         if bad:
@@ -314,8 +405,10 @@ class RunStore:
         with self.conn:
             cursor = self.conn.execute(f"UPDATE runs SET {assignments} WHERE run_id = ?",
                                        (*changes.values(), run_id))
-        if cursor.rowcount == 0:  # rowcount = how many rows were changed
-            raise KeyError(f"no run with run_id {run_id!r}")
+            if cursor.rowcount == 0:  # rowcount = how many rows were changed
+                raise KeyError(f"no run with run_id {run_id!r}")
+            self._audit(run_id, actor=actor, action=action, result_code=result_code,
+                        request_id=request_id, detail=detail)
         return self.get(run_id)
 
     def get(self, run_id: str) -> Optional[RunRecord]:
@@ -354,34 +447,42 @@ class RunStore:
         return {"body_hash": row["body_hash"], "status_code": row["status_code"],
                 "response": json.loads(row["response_json"])}
 
+    def _insert_receipt(self, caller_id, endpoint, key, body_hash, status_code, response) -> None:
+        """Remove an expired receipt for this key (so it can be reused), then insert the new one.
+
+        Called inside the caller's transaction. Raises sqlite3.IntegrityError if a
+        current receipt for the key already exists.
+        """
+        expired = _iso(datetime.now(timezone.utc) - RECEIPT_LIFETIME)
+        self.conn.execute(
+            "DELETE FROM receipts WHERE caller_id = ? AND endpoint = ? AND key = ? AND created_at < ?",
+            (caller_id, endpoint, key, expired))
+        self.conn.execute(
+            "INSERT INTO receipts (caller_id, endpoint, key, body_hash, status_code, "
+            "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (caller_id, endpoint, key, body_hash, status_code, json.dumps(response), _now()))
+
     def create_with_receipt(self, run_id: str, objective: str, config: RunConfig,
                             policy_version: str, knowledge_snapshot_id: Optional[str],
                             model_version: Optional[str], *, caller_id: str, endpoint: str,
-                            key: str, body_hash: str, status_code: int,
-                            response: dict) -> bool:
-        """Create a queued run AND remember the reply for its idempotency key, together.
+                            key: str, body_hash: str, status_code: int, response: dict,
+                            actor: str, request_id: Optional[str] = None) -> bool:
+        """Create a queued run, remember the reply for its idempotency key, and audit it, together.
 
-        Both happen in ONE transaction: either both are saved or neither. If the
-        same key arrives twice at the same moment, only one insert can succeed
+        All happen in ONE transaction: either all are saved or none. If the same
+        key arrives twice at the same moment, only one receipt insert can succeed
         (the receipt's PRIMARY KEY), so only one run is created.
 
         Returns True if this call created the run, False if the key was already
         used (then nothing is created; the caller should reply with the stored receipt).
         """
-        expired = _iso(datetime.now(timezone.utc) - RECEIPT_LIFETIME)
         try:
             with self.conn:
-                # A receipt older than 24 h no longer counts: remove it so the key can be reused.
-                self.conn.execute(
-                    "DELETE FROM receipts WHERE caller_id = ? AND endpoint = ? AND key = ? "
-                    "AND created_at < ?", (caller_id, endpoint, key, expired))
-                self.conn.execute(
-                    "INSERT INTO receipts (caller_id, endpoint, key, body_hash, status_code, "
-                    "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (caller_id, endpoint, key, body_hash, status_code, json.dumps(response), _now()))
+                self._insert_receipt(caller_id, endpoint, key, body_hash, status_code, response)
                 self._insert_run(run_id, objective, config, policy_version,
                                  knowledge_snapshot_id, model_version,
                                  created_at=response.get("created_at"))
+                self._audit(run_id, actor=actor, action="run_created", request_id=request_id)
         except sqlite3.IntegrityError:  # the key is already in use -> everything was undone
             return False
         return True
@@ -392,16 +493,9 @@ class RunStore:
 
         Returns False if a receipt for this key already exists (nothing is changed).
         """
-        expired = _iso(datetime.now(timezone.utc) - RECEIPT_LIFETIME)
         try:
             with self.conn:
-                self.conn.execute(
-                    "DELETE FROM receipts WHERE caller_id = ? AND endpoint = ? AND key = ? "
-                    "AND created_at < ?", (caller_id, endpoint, key, expired))
-                self.conn.execute(
-                    "INSERT INTO receipts (caller_id, endpoint, key, body_hash, status_code, "
-                    "response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (caller_id, endpoint, key, body_hash, status_code, json.dumps(response), _now()))
+                self._insert_receipt(caller_id, endpoint, key, body_hash, status_code, response)
         except sqlite3.IntegrityError:
             return False
         return True
@@ -416,7 +510,7 @@ class RunStore:
         One SQL statement does it all: change the run to "running" and record the
         worker, but ONLY IF it is still "queued" at that instant. Two workers can
         never both claim the same run, because only one change can match.
-        (RETURNING gives back the run_id of the row that was changed.)
+        (RETURNING gives back the run_id of the row that was changed.) Audited.
         """
         now = _now()
         with self.conn:
@@ -426,6 +520,8 @@ class RunStore:
                 "                ORDER BY created_at, rowid LIMIT 1) "
                 "AND status = 'queued' RETURNING run_id",
                 (worker_id, now, now)).fetchone()
+            if row:
+                self._audit(row["run_id"], actor=f"worker:{worker_id}", action="run_claimed")
         return self.get(row["run_id"]) if row else None
 
     def claim_stale(self, worker_id: str, stale_after: timedelta,
@@ -435,7 +531,7 @@ class RunStore:
         A run is "stale" if its heartbeat is older than `stale_after` (or missing):
         its worker probably crashed. The new worker claims it (only if the
         heartbeat is still stale at that instant) and can then resume it.
-        `now` exists so tests can pretend time has passed.
+        `now` exists so tests can pretend time has passed. Audited.
         """
         moment = now or datetime.now(timezone.utc)
         cutoff = _iso(moment - stale_after)  # heartbeats older than this are stale
@@ -448,6 +544,9 @@ class RunStore:
                 "AND status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?) "
                 "RETURNING run_id",
                 (worker_id, _iso(moment), _iso(moment), cutoff, cutoff)).fetchone()
+            if row:
+                self._audit(row["run_id"], actor=f"worker:{worker_id}", action="run_taken_over",
+                            detail=f"no heartbeat for over {int(stale_after.total_seconds())} s")
         return self.get(row["run_id"]) if row else None
 
     def heartbeat(self, run_id: str, worker_id: str) -> bool:
@@ -456,7 +555,8 @@ class RunStore:
         Only the worker named in claimed_by can update the heartbeat. If another
         worker has taken the run over (e.g. after this one froze for a while),
         this returns False and this worker should stop working on it, so two
-        workers never both keep going on one run.
+        workers never both keep going on one run. (Not audited: it happens every
+        20 seconds and would drown out the events that matter.)
         """
         with self.conn:
             cursor = self.conn.execute(
@@ -464,23 +564,27 @@ class RunStore:
                 (_now(), run_id, worker_id))
         return cursor.rowcount > 0
 
-    def request_cancel(self, run_id: str) -> RunRecord:
+    def request_cancel(self, run_id: str, *, actor: str, request_id: Optional[str] = None) -> RunRecord:
         """Mark a run as "please stop" (POST /runs/{id}/cancel). The worker checks it between steps.
 
         A queued run that no worker has started yet is stopped straight away.
         Raises KeyError if the run doesn't exist. Whether the run has already
-        finished (D2: 409 RUN_CLOSED) is checked by the API before calling this.
+        finished (D2: 409 RUN_CLOSED) is checked by the API before calling this. Audited.
         """
         now = _now()
         with self.conn:
             cursor = self.conn.execute(
                 "UPDATE runs SET cancel_requested = 1, updated_at = ? WHERE run_id = ?", (now, run_id))
+            if cursor.rowcount == 0:
+                raise KeyError(f"no run with run_id {run_id!r}")
+            self._audit(run_id, actor=actor, action="cancel_requested", request_id=request_id)
             # Never started -> nothing to interrupt: end it now.
-            self.conn.execute(
+            stopped = self.conn.execute(
                 "UPDATE runs SET status = 'stopped', stop_reason = 'cancelled', updated_at = ? "
                 "WHERE run_id = ? AND status = 'queued'", (now, run_id))
-        if cursor.rowcount == 0:
-            raise KeyError(f"no run with run_id {run_id!r}")
+            if stopped.rowcount:
+                self._audit(run_id, actor=actor, action="run_cancelled", request_id=request_id,
+                            detail="cancelled before any worker started it")
         return self.get(run_id)
 
     def is_cancel_requested(self, run_id: str) -> bool:

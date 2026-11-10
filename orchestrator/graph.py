@@ -58,6 +58,7 @@ from rdkit import Chem, RDLogger
 
 from .interfaces import ConstraintPacket, Tools
 from .near_miss import compute_near_miss, nm4_made_progress, rank_near_misses
+from .retry import call_with_retry
 from .state import Candidate, ChemistryViolation, OPVState
 from .storage import make_serializer
 
@@ -67,7 +68,9 @@ RDLogger.DisableLog("rdApp.*")
 
 
 def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = time.time,
-                should_cancel: Callable[[str], bool] | None = None):
+                should_cancel: Callable[[str], bool] | None = None,
+                on_event: Callable[..., None] | None = None,
+                sleep: Callable[[float], None] = time.sleep):
     """Build the flowchart around the given tools and return a runnable graph.
 
     Parameters:
@@ -84,6 +87,16 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
                        RunStore.is_cancel_requested). Checked before every step
                        (D2: "cancellation is observed at each checkpoint").
                        None = the run can't be cancelled (demo, most tests).
+        on_event     - optional function that receives AUDIT EVENTS from inside the
+                       run: on_event(run_id, action=..., result_code=..., phase=...,
+                       attempt=..., detail=...). The worker passes
+                       RunStore.record_event. Events: every failed/retried tool
+                       attempt, and a summary of each finished round. None = not recorded.
+        sleep        - the waiting function used between retries (retry.py).
+                       Tests pass one that doesn't really wait.
+
+    EVERY TOOL CALL is retried by D2's rules (retry.py, decisions Q1/Q2 of
+    2026-11-10): up to 3 attempts for temporary errors, none for permanent ones.
 
     Returns a compiled graph. Run it with:
         graph.invoke({"run_id": ..., "objective": ..., "config": ..., "policy": ...},
@@ -98,6 +111,22 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
     # NODES (the steps). Each one receives the current state and returns a
     # dictionary of ONLY the keys it changes.
     # ======================================================================
+
+    def emit(run_id: str, **event) -> None:
+        """Send one audit event to on_event, if one was given."""
+        if on_event is not None:
+            on_event(run_id, **event)
+
+    def call_tool(state: OPVState, tool: str, call):
+        """Call a tool through the retry rules, reporting failed/retried attempts as audit events.
+
+        Only the error's TYPE goes into the audit detail, never its message, which
+        might contain SMILES (D2: no molecular text in the audit log).
+        """
+        def report(tool_name, attempt, result_code, error):
+            emit(state["run_id"], action="tool_attempt", result_code=result_code, phase=tool_name,
+                 attempt=attempt, detail=type(error).__name__ if error else None)
+        return call_with_retry(tool, call, report=report, sleep=sleep)
 
     def timed(step):
         """Wrap a step so it also reports how long it worked (for the time budget).
@@ -146,7 +175,8 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
 
     def retrieve(state: OPVState) -> dict:
         """Fetch evidence from Kyle's knowledge base (stored for later use; nothing reads it yet)."""
-        return {"evidence": tools.retriever.retrieve(state.get("objective", ""), state["config"])}
+        return {"evidence": call_tool(state, "retriever", lambda: tools.retriever.retrieve(
+            state.get("objective", ""), state["config"]))}
 
     def generate(state: OPVState) -> dict:
         """Start a new round: build the ConstraintPacket and ask the generator for candidates.
@@ -163,7 +193,7 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
             parents=state["parents"],  # last round's Revise candidates (empty in round 1)
             candidate_limit=cfg.candidate_limit, seed=cfg.seed,
         )
-        result = tools.generator.generate_validate(packet)
+        result = call_tool(state, "generator", lambda: tools.generator.generate_validate(packet))
         # Keep BOTH lists in the batch: rejected candidates are still logged in
         # history ("log every candidate"). They already carry chemistry_violations.
         return {"batch": result.valid + result.rejected, "iteration": iteration}
@@ -218,7 +248,7 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
         Invalid candidates are skipped: D2 says invalid chemistry never reaches the predictor.
         """
         valid = [c for c in state["batch"] if c.valid]
-        predictions = tools.predictor.predict(valid) if valid else []
+        predictions = call_tool(state, "predictor", lambda: tools.predictor.predict(valid)) if valid else []
         if len(predictions) != len(valid):  # the contract says one per candidate (D1)
             raise RuntimeError(f"predictor returned {len(predictions)} predictions "
                                f"for {len(valid)} candidates")
@@ -243,7 +273,8 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
 
         # D2: a missed target becomes "Revise" only if another round is allowed.
         iterations_remain = state["iteration"] < cfg.max_iterations
-        decisions = tools.gate.decide(ok, cfg, policy, iterations_remain) if ok else []
+        decisions = (call_tool(state, "gate", lambda: tools.gate.decide(ok, cfg, policy, iterations_remain))
+                     if ok else [])
         # Attach each decision, plus the near-miss numbers (formulas NM-1, NM-2), to its candidate.
         judged = {c.candidate_id: c.model_copy(update={
                       "decision": d, "near_miss": compute_near_miss(c, cfg.constraints)})
@@ -256,6 +287,14 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
 
         # Formula NM-4 (near_miss.py): did this round get closer to the goal?
         progress = nm4_made_progress(batch, state.get("history", []))
+
+        # Audit: a one-line summary of the round, COUNTS ONLY (no SMILES, D2).
+        counts = {o: len(with_outcome(o)) for o in ("Accept", "Revise", "Escalate", "Stop")}
+        emit(state["run_id"], action="iteration_finished", phase="decide",
+             detail=(f"round {state['iteration']}: {len(batch)} candidates: "
+                     + ", ".join(f"{n} {o}" for o, n in counts.items())
+                     + f", {sum(1 for c in batch if not c.valid)} invalid, "
+                     + f"{len(failed)} failed predictions"))
         updates = {
             "batch": batch,
             "history": batch,  # APPENDED: log every candidate, whatever happened to it
@@ -282,7 +321,8 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
         return {
             "status": status,
             "stop_reason": reason,
-            "ranked": tools.ranker.rank(state.get("accepted", [])),  # Nyla's shortlist ranking
+            "ranked": call_tool(state, "ranker",  # Nyla's shortlist ranking
+                                lambda: tools.ranker.rank(state.get("accepted", []))),
             "near_misses": rank_near_misses(history),  # formula NM-3, closest first
         }
 

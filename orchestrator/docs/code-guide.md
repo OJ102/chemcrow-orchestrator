@@ -22,6 +22,8 @@ Contents:
 10. [policies.py: approved policy versions](#10-policiespy-approved-policy-versions)
 11. [worker.py: the worker program](#11-workerpy-the-worker-program)
 12. [api.py: the web API](#12-apipy-the-web-api)
+    - [12b. retry.py: retrying tool calls](#12b-retrypy-retrying-tool-calls-item-6)
+    - [12c. logs.py: the operational log](#12c-logspy-the-operational-log)
 13. [\_\_init\_\_.py and \_\_main\_\_.py](#13-__init__py-and-__main__py)
 14. [The tests](#14-the-tests)
 15. [One run, step by step](#15-one-run-step-by-step)
@@ -308,6 +310,12 @@ g.add_node(name, timed(fn))
 Time *between* steps, such as a machine being off overnight after a crash, is
 never added, so a resumed run isn't stopped for downtime.
 
+**Every tool call is retried** by D2's rules through `call_tool` → `retry.call_with_retry`
+(section 12b). `build_graph(..., on_event=...)` receives audit events from inside
+the run: each failed or retried tool attempt (tool name, attempt, error **type**
+only) and an `iteration_finished` summary per round ("round 2: 8 candidates: 2 Accept,
+5 Revise, ...": counts, no SMILES). The worker passes `RunStore.record_event`.
+
 **The middle steps can be cancelled** (D2: "cancellation is observed at each
 checkpoint"). `build_graph(..., should_cancel=...)` takes a function that answers
 "has someone asked run X to stop?" (the worker passes `RunStore.is_cancel_requested`).
@@ -413,6 +421,18 @@ def make_checkpointer(runs_dir=DEFAULT_RUNS_DIR) -> SqliteSaver:
 | `find_receipt` / `save_receipt` | API | Look up / store the first reply to a POST |
 | `worker_seen` / `last_worker_seen` | worker / API | "I'm alive" / "when was a worker last alive?" |
 
+**The audit log (item 6, 2026-11-10):** a fourth table, `audit_events`, with D2's
+fields (event_id, request_id, run_id, actor_id, action, result_code, phase,
+attempt, created_at) plus `seq` (an ever-increasing number giving the reliable
+order) and `detail` (codes and counts only, **never SMILES**). Every method that
+changes a run writes its audit event **in the same transaction**, so if the
+event can't be saved, the change is undone too (D2). That's why `create`,
+`update`, `request_cancel` and friends now require an `actor`, and `update`
+also requires an `action`. An empty actor is refused by the database. Events
+that aren't a change to the runs table (retried tool calls, finished rounds)
+use `record_event`. `list_events(run_id, limit, after_seq)` reads them back in order.
+Heartbeats are **not** audited (every 20 s would drown out the real events).
+
 **Still deferred:** D2's full leases with fencing tokens. The heartbeat and
 `claimed_by` checks are a lighter version, enough for one worker.
 
@@ -439,6 +459,11 @@ record = resume_run(graph, store, run_id)                                 # cont
 - **`saved_state(checkpointer, run_id)`**: a run's latest saved state, read
   straight from the checkpoint database without running anything (used by the
   API for the shortlist, the report and live iteration).
+- **Failure codes** (`failure_of`, decision Q7): `RetriesExhausted` → `DEPENDENCY_UNAVAILABLE`,
+  `ToolFailed` → `TOOL_ERROR`, anything else → `INTERNAL_ERROR`; a run that ends
+  because every prediction failed → `ALL_PREDICTIONS_FAILED`. Stored in `failure_code`.
+- Every outcome is audited: `run_started`/`run_resumed`, then `run_completed`,
+  `run_stopped`, `run_cancelled` or `run_failed`, with the actor (`cli` or `worker:<id>`).
 - **`_drive`**: if the graph throws **any** error, the run is recorded as
   `failed` with `"ErrorType: message"` in `failure` and the last saved
   iteration, instead of crashing the caller. Retries before giving up come in item 6.
@@ -490,6 +515,7 @@ with uvicorn on **127.0.0.1 only**.
 | `POST /api/v1/runs/{run_id}/cancel` | D2 | body `{}`; → `202`; ended run → `409 RUN_CLOSED` |
 | `GET /api/v1/runs/{run_id}/shortlist?limit=` | D1 | completed runs only, else `409 RESULTS_NOT_READY` |
 | `GET /api/v1/runs/{run_id}/report` | Nyla | every candidate in full + id lists + pinned versions + `not_yet_available` |
+| `GET /api/v1/runs/{run_id}/events?limit=&cursor=` | D2 G4 | the audit trail, oldest first; `next_cursor` for the next page; bad cursor → 422 |
 | `GET /api/v1/health` | ours | `worker_online` = a worker seen in the last 60 s |
 
 **`CreateRunRequest`**: D1's fields plus our additions: `target_type` and
@@ -518,6 +544,37 @@ afterwards, because the server answers requests on several threads.
 
 ---
 
+## 12b. `retry.py`: retrying tool calls (item 6)
+
+Every tool call in the graph goes through `call_with_retry(tool, call, report=..., sleep=...)`:
+
+| Situation | What happens | Run fails with |
+|---|---|---|
+| Success first time | Return the result; nothing reported | — |
+| `TemporaryToolError`, `TimeoutError` or `ConnectionError` | Report it, wait 1 s (then 2 s) + 0–0.25 s jitter, try again; at most 3 attempts | `DEPENDENCY_UNAVAILABLE` (as `RetriesExhausted`) if all 3 fail |
+| Any other error | Report it; **no** retry | `TOOL_ERROR` (as `ToolFailed`) |
+| Success after a retry | Report `succeeded_after_retry` | — |
+
+`TemporaryToolError` is defined in `interfaces.py`: teammates' tools raise it to
+mean "try me again". `sleep` and `rng` are replaceable, so tests don't really wait.
+
+**Deadlines** (D2: 120 s per generation/prediction call) are stored in
+`Policy.deadlines_seconds` but **not enforced yet** (decision Q3): each real tool's
+connection code will enforce its own as a network timeout, which then counts as
+a temporary error.
+
+---
+
+## 12c. `logs.py`: the operational log
+
+`setup_logging(runs_dir, program)` sends our log messages to the screen and to
+`runs_dir/logs/<program>.log`: 5 MB per file, 3 old files kept (D2: "bounded
+rotating files"). `serve` writes `api.log` (one line per request: method, path,
+status, time, request ID, never bodies or tokens); `worker` writes `worker.log`.
+This is separate from the **audit log**, which lives in the database.
+
+---
+
 ## 13. `__init__.py` and `__main__.py`
 
 `__init__.py` re-exports the public names (`build_graph`, `Tools`, `RunConfig`,
@@ -542,7 +599,7 @@ to start unless `ORCHESTRATOR_API_TOKEN` is set). `python -m orchestrator worker
 
 ## 14. The tests
 
-Run: `python -m pytest orchestrator/tests -v` (from the repo root, langgraph venv). 63 tests.
+Run: `python -m pytest orchestrator/tests -v` (from the repo root, langgraph venv). 82 tests.
 
 **`fakes.py`** (shared helpers, not tests):
 ```python
@@ -563,6 +620,8 @@ def run(batches, table=None, default=GOOD, clock=None, **config_changes): ...
 | `test_graph.py` | completes when nothing is left to revise; parents with violations reach the generator and lineage is recorded; stops at the iteration budget; all-failed → failed; time budget (fake clock); escalate sets aside without pausing; the validate safety net catches invalid and repeated molecules; a failed prediction is logged; the optional rules are off by default; `target_count` and `patience` work; an invalid partner is rejected |
 | `test_storage.py` | a finished run survives a restart (brand-new saver, graph and store read it back); reloading logs no "unregistered type" message; a crash mid-run is recorded as `failed` with the error and resume finishes it without redoing round 1; **downtime doesn't count** against the time budget; resume refuses finished and unknown runs; the runs table creates, updates, gets and lists runs and refuses bad columns, unknown runs and invalid statuses |
 | `test_worker.py` | nothing queued → nothing done; a queued run is claimed and run to the end; oldest first; unknown policy → failed; **cancel during round 2** stops before the next step and keeps round 1; cancelling a queued run needs no worker; a **stale run is taken over and resumed** without redoing round 1; the heartbeat notices a takeover; a worker that lost the run doesn't overwrite its status |
+| `test_retry.py` | success first time → no retry; temporary errors retried with 1 s then 2 s waits; three temporary failures → `RetriesExhausted`; permanent errors never retried → `ToolFailed`; timeouts and connection errors count as temporary; jitter stays under 0.25 s |
+| `test_audit.py` | a run's full audit trail in order with the right actors; **no SMILES anywhere in the audit log**; an audit record that can't be saved undoes the change; a temporary generator error is retried and the run carries on; a generator that stays down → `DEPENDENCY_UNAVAILABLE` after exactly 3 attempts; `ALL_PREDICTIONS_FAILED`; a broken predictor contract → `INTERNAL_ERROR`; the events endpoint pages with a cursor and rejects bad cursors; failure codes in the API; cancel audited with its request ID; the log file is written |
 | `test_api.py` | token required (401); create → 202 + Location; same key + same body → same run (only one created); same key + different body → 409; missing key → 422; six invalid bodies → 422 naming the field; not JSON → 400; wrong content type → 415; unknown run → 404, malformed ID → 422; list with filters; results not ready while queued → 409; **full lifecycle** API → worker → shortlist, report, health; cancel → stopped/cancelled, repeat with same key → same reply, new cancel → 409 RUN_CLOSED; cancel body must be `{}` |
 
 ---

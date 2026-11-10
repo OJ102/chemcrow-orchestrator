@@ -12,6 +12,7 @@ format), plus D2's cancel endpoint and two endpoints Nyla asked for:
   POST /api/v1/runs/{run_id}/cancel       ask a run to stop                  (D2)
   GET  /api/v1/runs/{run_id}/shortlist    the ranked results (completed runs only)
   GET  /api/v1/runs/{run_id}/report       everything about a run in one bundle (Nyla)
+  GET  /api/v1/runs/{run_id}/events       the run's audit log, page by page  (D2 G4)
   GET  /api/v1/health                     is a worker running?               (our addition)
 
 It never RUNS anything: POST /runs only records the run as "queued" and replies
@@ -30,8 +31,14 @@ Proper user accounts (D2's G1) are deferred.
 Start it with:   python -m orchestrator serve --db runs --port 8100
 """
 
+# logging: one line per request in runs/logs/api.log (see logs.py).
+import logging
+
 # secrets.compare_digest: compares two secrets safely (see require_token).
 import secrets
+
+# time.perf_counter: a precise stopwatch, to log how long each request took.
+import time
 
 # sqlite3: only to recognise "database unavailable" errors (-> 503).
 import sqlite3
@@ -60,6 +67,11 @@ MAX_BODY_BYTES = 1024 * 1024  # D1: bodies over 1 MiB are refused (413)
 # Phase 1 has ONE shared token, so every caller is the same caller as far as
 # idempotency receipts are concerned (D2 keys receipts by caller).
 SHARED_CALLER = "shared-token"
+# How the API appears in the audit log (actor_id). With proper user accounts
+# (deferred), this would become the user who made the request.
+API_ACTOR = "api"
+
+log = logging.getLogger("orchestrator.api")  # this file's channel in the operational log
 
 
 # ============================================================================
@@ -207,8 +219,12 @@ def create_app(runs_dir: Path, api_token: str,
             if not request.headers.get("content-type", "").startswith("application/json"):
                 return _error_response(request, 415, "UNSUPPORTED_MEDIA_TYPE",
                                        "Content-Type must be application/json")
+        began = time.perf_counter()
         response = await call_next(request)  # let the endpoint handle it
         response.headers["X-Request-ID"] = request.state.request_id
+        # Operational log: method, path, status, time, request id. Never bodies or tokens.
+        log.info("%s %s -> %d (%.0f ms) request_id=%s", request.method, request.url.path,
+                 response.status_code, (time.perf_counter() - began) * 1000, request.state.request_id)
         return response
 
     # --- Turn every kind of error into D1's error format ---
@@ -237,7 +253,13 @@ def create_app(runs_dir: Path, api_token: str,
 
     @app.exception_handler(Exception)
     async def on_unexpected_error(request: Request, exc: Exception):
-        """Anything else: 500, WITHOUT the internal error details (D1: no stack traces exposed)."""
+        """Anything else: 500, WITHOUT the internal error details (D1: no stack traces exposed).
+
+        The full details go to the operational log instead (api.log), with the
+        request_id, so whoever runs the server can find out what went wrong.
+        """
+        log.error("unexpected error, request_id=%s", getattr(request.state, "request_id", "?"),
+                  exc_info=exc)
         return _error_response(request, 500, "INTERNAL_ERROR", "Unexpected server failure")
 
     # --- Helpers shared by the endpoints ---
@@ -299,7 +321,9 @@ def create_app(runs_dir: Path, api_token: str,
                 "patience": cfg.patience,
             },
             "prediction_batch_id": None,  # D1 field; needs D2's batch records (not built yet)
-            "failure": ({"code": "RUN_FAILED", "message": record.failure}
+            # D1: {code, message} for failed runs. The code says WHY (decision Q7):
+            # DEPENDENCY_UNAVAILABLE, TOOL_ERROR, ALL_PREDICTIONS_FAILED, UNKNOWN_POLICY, INTERNAL_ERROR.
+            "failure": ({"code": record.failure_code or "INTERNAL_ERROR", "message": record.failure}
                         if record.status == "failed" and record.failure else None),
             # our additions:
             "stop_reason": record.stop_reason,
@@ -311,7 +335,7 @@ def create_app(runs_dir: Path, api_token: str,
     # ========================================================================
 
     @app.post(f"{API_PREFIX}/runs", status_code=202)
-    def create_run(body: CreateRunRequest, store: RunStore = Depends(get_store),
+    def create_run(body: CreateRunRequest, request: Request, store: RunStore = Depends(get_store),
                    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
         """Record a new run as "queued" and reply at once (D1). The worker runs it later."""
         key = check_key(idempotency_key)
@@ -338,7 +362,8 @@ def create_app(runs_dir: Path, api_token: str,
             run_id, body.objective, config, body.policy_version,
             str(body.knowledge_snapshot_id), body.model_version,
             caller_id=SHARED_CALLER, endpoint=endpoint, key=key, body_hash=body_hash,
-            status_code=202, response=response)
+            status_code=202, response=response,
+            actor=API_ACTOR, request_id=request.state.request_id)  # audit: who and which request
         if not created:  # an identical request won the race a moment ago: reply as it did
             return replay(store.find_receipt(SHARED_CALLER, endpoint, key), body_hash)
         return JSONResponse(response, status_code=202,
@@ -356,7 +381,8 @@ def create_app(runs_dir: Path, api_token: str,
         return run_view(find_run(store, run_id), live=True)
 
     @app.post(f"{API_PREFIX}/runs/{{run_id}}/cancel", status_code=202)
-    def cancel_run(run_id: UUID, body: CancelRequest, store: RunStore = Depends(get_store),
+    def cancel_run(run_id: UUID, body: CancelRequest, request: Request,
+                   store: RunStore = Depends(get_store),
                    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
         """Ask a run to stop (D2). It ends "stopped", reason "cancelled", keeping work done so far.
 
@@ -372,7 +398,8 @@ def create_app(runs_dir: Path, api_token: str,
         record = find_run(store, run_id)
         if record.status in FINISHED or record.status == "failed":
             raise ApiError(409, "RUN_CLOSED", f"Run already ended with status {record.status!r}")
-        record = store.request_cancel(record.run_id)
+        record = store.request_cancel(record.run_id, actor=API_ACTOR,
+                                      request_id=request.state.request_id)
         response = {"run_id": record.run_id, "status": record.status, "cancel_requested": True}
         store.save_receipt(caller_id=SHARED_CALLER, endpoint=endpoint, key=key, body_hash=body_hash,
                            status_code=202, response=response)
@@ -434,13 +461,37 @@ def create_app(runs_dir: Path, api_token: str,
             "failed_prediction_ids": ids("failed_predictions"),
             # every candidate ever made, in full (model_dump(mode="json") = as plain JSON data)
             "candidates": [c.model_dump(mode="json") for c in saved.get("history", [])],
+            # The run's audit log is long, so it has its own (paged) endpoint:
+            "events": f"{API_PREFIX}/runs/{record.run_id}/events",
             # Parts of Nyla's request that don't exist in the system yet:
             "not_yet_available": [
                 "human reviews (approve/decline with reviewer, time, reason): needs D2 Handoff/Feedback records",
-                "audit event log: item 6",
                 "prediction_batch_id: needs D2 PredictionBatch records",
             ],
         }
+
+    @app.get(f"{API_PREFIX}/runs/{{run_id}}/events")
+    def list_events(run_id: UUID, limit: int = Query(default=50, ge=1, le=100),
+                    cursor: Optional[str] = Query(default=None, max_length=256),
+                    store: RunStore = Depends(get_store)):
+        """A run's AUDIT LOG, oldest first, one page at a time (D2 G4).
+
+        Each event: who (actor_id), what (action), how it went (result_code),
+        where (phase), which attempt, and a short detail (never SMILES).
+        Paging: if there may be more events, the reply has a `next_cursor`; pass
+        it back as ?cursor=... to get the next page. An invalid cursor -> 422 (D2).
+        """
+        record = find_run(store, run_id)
+        after = 0
+        if cursor is not None:
+            if not cursor.isdigit():  # our cursors are always the position number of the last event
+                raise ApiError(422, "VALIDATION_ERROR", "Invalid request",
+                               [{"field": "cursor", "reason": "Not a cursor returned by this endpoint"}])
+            after = int(cursor)
+        events = store.list_events(record.run_id, limit=limit, after_seq=after)
+        # A full page might mean more events follow: give the position to continue from.
+        next_cursor = str(events[-1]["seq"]) if len(events) == limit else None
+        return {"items": events, "next_cursor": next_cursor}
 
     @app.get(f"{API_PREFIX}/health")
     def health(store: RunStore = Depends(get_store)):

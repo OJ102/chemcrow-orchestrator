@@ -44,6 +44,29 @@ from .state import (Candidate, Decision, Policy, Prediction, RunConfig, RunConst
 
 
 # ============================================================================
+# HOW A TOOL SAYS "TRY ME AGAIN"
+# ============================================================================
+
+class TemporaryToolError(Exception):
+    """Raise this from a tool to mean "a TEMPORARY problem, please try again".
+
+    Examples: the model server is busy, a network hiccup, the GPU is briefly out
+    of memory. The orchestrator then retries the call (up to 3 attempts in
+    total, waiting 1 s and then 2 s; see retry.py). D2 calls this a
+    "RetryableDependency" error.
+
+    Any OTHER error from a tool counts as PERMANENT (e.g. invalid input, a bug)
+    and is never retried, because it would just fail the same way again (D2:
+    "permanent validation errors are never retried"). Python's built-in
+    TimeoutError and ConnectionError also count as temporary.
+
+    Example in a teammate's tool:
+        if response.status_code == 503:
+            raise TemporaryToolError("Chemprop server busy")
+    """
+
+
+# ============================================================================
 # DATA PASSED TO / RETURNED FROM THE GENERATOR
 # ============================================================================
 

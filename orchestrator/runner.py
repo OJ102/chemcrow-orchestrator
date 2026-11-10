@@ -17,10 +17,18 @@ agreed with Nyla, so there's one ID per run.
 
 Status flow in the runs table (D1 statuses):
   queued -> running -> completed | stopped | failed
-  If the program throws an error, the run is marked "failed" with the error
-  message, so it never stays stuck on "running". A failed or interrupted run
-  can be resumed, which sets it back to "running".
-  (Item 6 adds retries before giving up, and the audit log.)
+  If the run hits an error, it's marked "failed" with a FAILURE CODE and the
+  error message (decision Q7, 2026-11-10), so it never stays stuck on "running":
+    DEPENDENCY_UNAVAILABLE  a tool kept failing TEMPORARILY; all 3 attempts used (retry.py)
+    TOOL_ERROR              a tool failed PERMANENTLY (not retried)
+    ALL_PREDICTIONS_FAILED  every prediction in a round failed
+    UNKNOWN_POLICY          the run names a policy that isn't registered (worker.py)
+    INTERNAL_ERROR          anything else: a bug in our own code
+  D2 says a failed run should be replaced by a NEW run; the command-line
+  --resume can still resume one, which is handy while developing.
+
+Every change is written to the AUDIT LOG together with WHO made it (`actor`):
+"cli" for the command line, "worker:<id>" for the worker.
 """
 
 # Callable: the type of "something you can call like a function".
@@ -29,6 +37,7 @@ from typing import Callable
 # uuid4(): a new random unique ID for each run.
 from uuid import uuid4
 
+from .retry import RetriesExhausted, ToolFailed
 from .state import Policy, RunConfig
 from .storage import RunRecord, RunStore
 
@@ -53,8 +62,17 @@ def saved_state(checkpointer, run_id: str) -> dict:
     return dict(checkpoint["channel_values"]) if checkpoint else {}
 
 
+def failure_of(error: BaseException) -> tuple[str, str]:
+    """Turn an error into (failure code, message) for the runs table (decision Q7)."""
+    if isinstance(error, RetriesExhausted):
+        return "DEPENDENCY_UNAVAILABLE", str(error)
+    if isinstance(error, ToolFailed):
+        return "TOOL_ERROR", str(error)
+    return "INTERNAL_ERROR", f"{type(error).__name__}: {error}"
+
+
 def start_run(graph, store: RunStore, *, objective: str, config: RunConfig, policy: Policy,
-              run_id: str | None = None) -> RunRecord:
+              run_id: str | None = None, actor: str = "cli") -> RunRecord:
     """Record a new run, run it to the end, and return its final runs-table row.
 
     Parameters (the * means everything after it must be given by name):
@@ -65,17 +83,18 @@ def start_run(graph, store: RunStore, *, objective: str, config: RunConfig, poli
         config    - the run's settings (targets, partner, limits)
         policy    - the approved scientific limits
         run_id    - normally left out: a fresh random ID is made. Tests pass one.
+        actor     - who is doing this, for the audit log
 
     Returns the run's row after it ends: status completed, stopped or failed.
     """
     run_id = run_id or str(uuid4())  # `a or b` = a, unless a is empty/None, then b
-    store.create(run_id, objective, config, policy.policy_version)  # status: queued
-    store.update(run_id, status="running")
+    store.create(run_id, objective, config, policy.policy_version, actor=actor)  # status: queued
+    store.update(run_id, actor=actor, action="run_started", status="running")
     inputs = {"run_id": run_id, "objective": objective, "config": config, "policy": policy}
-    return _drive(graph, store, run_id, inputs)
+    return _drive(graph, store, run_id, inputs, actor)
 
 
-def run_claimed(graph, store: RunStore, record: RunRecord, policy: Policy,
+def run_claimed(graph, store: RunStore, record: RunRecord, policy: Policy, *, actor: str,
                 still_owner: Callable[[], bool] = lambda: True) -> RunRecord:
     """Run a run that a worker has just claimed (status "running"), to the end.
 
@@ -89,14 +108,16 @@ def run_claimed(graph, store: RunStore, record: RunRecord, policy: Policy,
     must NOT write the final status, because the run belongs to someone else now.
     """
     if saved_state(graph.checkpointer, record.run_id):
+        store.record_event(record.run_id, actor=actor, action="run_resumed")
         inputs = None  # None = "continue this save slot from its last checkpoint"
     else:
+        store.record_event(record.run_id, actor=actor, action="run_started")
         inputs = {"run_id": record.run_id, "objective": record.objective,
                   "config": record.config, "policy": policy}
-    return _drive(graph, store, record.run_id, inputs, still_owner)
+    return _drive(graph, store, record.run_id, inputs, actor, still_owner)
 
 
-def resume_run(graph, store: RunStore, run_id: str) -> RunRecord:
+def resume_run(graph, store: RunStore, run_id: str, actor: str = "cli") -> RunRecord:
     """Continue a run from its last saved step, e.g. after a crash.
 
     Works for runs marked "failed" (an error was recorded) or still "running"
@@ -110,20 +131,21 @@ def resume_run(graph, store: RunStore, run_id: str) -> RunRecord:
         raise KeyError(f"no run with run_id {run_id!r}")
     if record.status in FINISHED:
         raise ValueError(f"run {run_id!r} already finished with status {record.status!r}")
-    store.update(run_id, status="running", failure=None)  # clear the old error message
+    # Clear the old error, and record that the run is being resumed.
+    store.update(run_id, actor=actor, action="run_resumed", status="running",
+                 failure=None, failure_code=None)
     # Passing None instead of inputs tells LangGraph: "don't start over, continue
     # this thread from its last checkpoint".
-    return _drive(graph, store, run_id, None)
+    return _drive(graph, store, run_id, None, actor)
 
 
-def _drive(graph, store: RunStore, run_id: str, inputs,
+def _drive(graph, store: RunStore, run_id: str, inputs, actor: str,
            still_owner: Callable[[], bool] = lambda: True) -> RunRecord:
-    """Run (or continue) the graph, then write the outcome into the runs table.
+    """Run (or continue) the graph, then write the outcome into the runs table and audit log.
 
-    Any error is caught and recorded as status "failed" with the error message
-    (D1: `failure` is set only for failed runs), instead of crashing the caller.
-    The state saved up to the error stays in the checkpoint database, so the run
-    can be resumed from there.
+    Any error is caught and recorded as status "failed" with a failure code and
+    message (D1: `failure` is set only for failed runs), instead of crashing the
+    caller. The state saved up to the error stays in the checkpoint database.
 
     If still_owner() says this worker lost the run to another worker, nothing is
     written, and the row is returned as it is.
@@ -133,14 +155,19 @@ def _drive(graph, store: RunStore, run_id: str, inputs,
     except Exception as error:  # deliberately broad: ANY error must be recorded, not lost
         if not still_owner():
             return store.get(run_id)
+        code, message = failure_of(error)
         saved = saved_state(graph.checkpointer, run_id)  # what was saved before the error
-        return store.update(run_id, status="failed", iteration=saved.get("iteration", 0),
-                            failure=f"{type(error).__name__}: {error}")
+        return store.update(run_id, actor=actor, action="run_failed", result_code=code,
+                            status="failed", iteration=saved.get("iteration", 0),
+                            failure=message, failure_code=code)
     if not still_owner():
         return store.get(run_id)
-    status = final["status"]
-    return store.update(run_id, status=status, iteration=final["iteration"],
-                        stop_reason=final.get("stop_reason"),
-                        # A run can also END as failed (every prediction failed). The
-                        # reason then also goes in `failure`, as D1 expects.
-                        failure=final.get("stop_reason") if status == "failed" else None)
+    status, reason = final["status"], final.get("stop_reason")
+    # The audit action names the outcome: run_completed / run_stopped / run_failed,
+    # or run_cancelled for a run stopped by a cancel request.
+    action = "run_cancelled" if reason == "cancelled" else f"run_{status}"
+    # A run can also END as failed without an error (every prediction failed).
+    code = "ALL_PREDICTIONS_FAILED" if status == "failed" else None
+    return store.update(run_id, actor=actor, action=action, result_code=code or "ok",
+                        status=status, iteration=final["iteration"], stop_reason=reason,
+                        failure=reason if status == "failed" else None, failure_code=code)

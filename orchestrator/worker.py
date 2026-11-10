@@ -25,6 +25,9 @@ WHY A SEPARATE PROGRAM: a slow or broken run can never slow down or crash the
 API, and later the heavy models (MatGPT, Chemprop) load only here, once.
 """
 
+# logging: writes the worker's messages to the screen and to runs/logs/worker.log (logs.py).
+import logging
+
 # os.getpid(): this program's process number; socket.gethostname(): the computer's
 # name. Both go into the worker's ID, so you can tell workers apart.
 import os
@@ -46,6 +49,16 @@ from .storage import RunRecord, RunStore
 HEARTBEAT_EVERY = 20.0  # seconds between heartbeats
 STALE_AFTER = timedelta(seconds=60)  # silence after which a running run counts as abandoned
 POLL_EVERY = 2.0  # seconds to wait before checking again when there's nothing to do
+
+log = logging.getLogger("orchestrator.worker")  # this file's channel in the operational log
+
+
+def default_worker_id() -> str:
+    """A name for this worker: "<computer>-<process id>-<6 random characters>".
+
+    os.getpid() = this program's process number; uuid4().hex[:6] = 6 random characters.
+    """
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:6]}"
 
 
 class Heartbeat:
@@ -105,8 +118,8 @@ class Worker:
                  worker_id: Optional[str] = None, heartbeat_every: float = HEARTBEAT_EVERY,
                  stale_after: timedelta = STALE_AFTER):
         self.graph, self.store, self.policies = graph, store, policies
-        # os.getpid() = this program's process number. uuid4().hex[:6] = 6 random characters.
-        self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:6]}"
+        self.worker_id = worker_id or default_worker_id()
+        self.actor = f"worker:{self.worker_id}"  # how this worker appears in the audit log
         self.heartbeat_every, self.stale_after = heartbeat_every, stale_after
 
     def process_next_run(self) -> Optional[RunRecord]:
@@ -123,27 +136,30 @@ class Worker:
             return None
         policy = self.policies.get(record.policy_version)
         if policy is None:  # the API checks this too; this guards against a registry change
-            return self.store.update(record.run_id, status="failed",
-                                     failure=f"unknown policy_version {record.policy_version!r}")
+            return self.store.update(record.run_id, actor=self.actor, action="run_failed",
+                                     result_code="UNKNOWN_POLICY", status="failed",
+                                     failure=f"unknown policy_version {record.policy_version!r}",
+                                     failure_code="UNKNOWN_POLICY")
+        log.info("run %s: claimed", record.run_id)
         with Heartbeat(self.store.runs_dir, record.run_id, self.worker_id,
                        self.heartbeat_every) as beat:
             # still_owner: "has nobody taken this run over?" (lambda = a tiny function)
-            return run_claimed(self.graph, self.store, record, policy,
+            return run_claimed(self.graph, self.store, record, policy, actor=self.actor,
                                still_owner=lambda: not beat.lost)
 
     def run_forever(self, poll_every: float = POLL_EVERY,
                     stop: Optional[threading.Event] = None) -> None:
         """Keep processing runs until `stop` is set (or the program is interrupted, Ctrl+C)."""
         stop = stop or threading.Event()
-        # flush=True writes each line out immediately. Otherwise, when the output goes
-        # to a log file, Python holds lines back and they can be lost if the worker is killed.
-        print(f"worker {self.worker_id} started; checking for runs every {poll_every:g} s", flush=True)
+        # log.info/warning write to the screen AND to runs/logs/worker.log (see logs.py),
+        # line by line, so nothing is lost if the worker is killed.
+        log.info("worker %s started; checking for runs every %g s", self.worker_id, poll_every)
         while not stop.is_set():
             record = self.process_next_run()
             if record is not None:
-                print(f"run {record.run_id}: {record.status}"
-                      + (f" ({record.stop_reason})" if record.stop_reason else "")
-                      + (f" - {record.failure}" if record.failure and not record.stop_reason else ""),
-                      flush=True)
+                if record.status == "failed":
+                    log.warning("run %s: failed [%s] %s", record.run_id, record.failure_code, record.failure)
+                else:
+                    log.info("run %s: %s (%s)", record.run_id, record.status, record.stop_reason)
             else:
                 stop.wait(poll_every)  # nothing to do: wait, then check again

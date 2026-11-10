@@ -40,6 +40,7 @@ from pathlib import Path
 # "from ." = from this package's __init__.py (which re-exports these names).
 from . import RunConfig, RunConstraints, Tools, build_graph
 from .gate import PlaceholderGate, PlaceholderRanker
+from .logs import setup_logging
 from .policies import PLACEHOLDER_POLICY
 from .runner import resume_run, start_run
 from .storage import RunStore, make_checkpointer
@@ -76,6 +77,10 @@ def serve_or_work(command: str, argv: list[str]) -> None:
         parser.add_argument("--poll", type=float, default=2.0, help="seconds between checks for new runs")
     args = parser.parse_args(argv)
 
+    # Operational log: screen + runs/logs/api.log or worker.log (rotating, logs.py).
+    log_file = setup_logging(Path(args.db), "api" if command == "serve" else "worker")
+    print(f"operational log: {log_file}")
+
     if command == "serve":
         # The shared secret is read from an ENVIRONMENT VARIABLE, not typed on the
         # command line, so it doesn't end up in shell history or process lists.
@@ -89,13 +94,17 @@ def serve_or_work(command: str, argv: list[str]) -> None:
         # host="127.0.0.1": only programs on THIS machine can connect (decision Q4).
         uvicorn.run(create_app(Path(args.db), token), host="127.0.0.1", port=args.port)
     else:
-        from .worker import Worker
+        from .worker import Worker, default_worker_id
         store = RunStore(args.db)
-        # should_cancel lets a cancel request made through the API stop the run between steps.
-        graph = build_graph(_fake_tools(), checkpointer=make_checkpointer(args.db),
-                            should_cancel=store.is_cancel_requested)
+        worker_id = default_worker_id()
+        graph = build_graph(
+            _fake_tools(), checkpointer=make_checkpointer(args.db),
+            # A cancel request made through the API stops the run between steps.
+            should_cancel=store.is_cancel_requested,
+            # Retried tool calls and finished rounds go into the audit log, under this worker's name.
+            on_event=lambda run_id, **event: store.record_event(run_id, actor=f"worker:{worker_id}", **event))
         try:
-            Worker(graph, store).run_forever(poll_every=args.poll)
+            Worker(graph, store, worker_id=worker_id).run_forever(poll_every=args.poll)
         except KeyboardInterrupt:  # Ctrl+C
             print("worker stopped")
 
@@ -116,7 +125,9 @@ def main() -> None:
     # Saving to disk (--db) or only in memory (no --db)?
     checkpointer = make_checkpointer(args.db) if args.db else None  # None = in memory
     store = RunStore(args.db) if args.db else None
-    graph = build_graph(_fake_tools(), checkpointer=checkpointer)
+    # When saving, retried tool calls and finished rounds also go into the audit log (actor "cli").
+    on_event = (lambda run_id, **event: store.record_event(run_id, actor="cli", **event)) if store else None
+    graph = build_graph(_fake_tools(), checkpointer=checkpointer, on_event=on_event)
 
     if args.list:
         for r in store.list():

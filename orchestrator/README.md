@@ -10,10 +10,11 @@ ranked shortlist. It follows the team design documents D1 and D2.
 > **Status (2026-11-10):** the loop follows the D1 data shapes and D2 run
 > behaviour; runs are **saved to disk and resumable**; and there's a **web API**
 > (D1/D2 endpoints plus Nyla's list and report) with a separate **worker
-> program** that runs queued runs. The retriever, generator and predictor are
-> **fakes that produce made-up numbers**, and the gate and ranker are
-> **placeholders** written to D2's rules. Next: retries, failure handling and
-> the audit log (item 6). See [docs/progress.md](docs/progress.md).
+> program** that runs queued runs. Tool calls are **retried** by D2's rules,
+> failures get **specific codes**, and every run leaves an **audit trail**. The
+> retriever, generator and predictor are **fakes that produce made-up numbers**,
+> and the gate and ranker are **placeholders** written to D2's rules. Items 4–6
+> are done; next is testing SynSpace (ModifyMol). See [docs/progress.md](docs/progress.md).
 
 ## Documentation
 
@@ -59,6 +60,8 @@ orchestrator/
 ├── policies.py        # registry of approved policy versions (only a placeholder so far)
 ├── worker.py          # the WORKER program: claims queued runs, heartbeats, recovers crashed runs
 ├── api.py             # the WEB API (FastAPI): D1/D2 endpoints + Nyla's list and report
+├── retry.py           # D2's retry rules for every tool call (3 attempts, 1 s / 2 s waits)
+├── logs.py            # the operational log: rotating files in runs/logs/
 ├── requirements.txt   # dependencies for the langgraph venv
 ├── docs/              # primer, spec alignment, code guide, progress log
 └── tests/
@@ -68,7 +71,9 @@ orchestrator/
     ├── test_graph.py      # the whole loop
     ├── test_storage.py    # saving, reloading after a restart, crash + resume, runs table
     ├── test_worker.py     # claiming, cancelling, stale-run takeover, heartbeats
-    └── test_api.py        # every endpoint, error format, token, idempotency
+    ├── test_api.py        # every endpoint, error format, token, idempotency
+    ├── test_retry.py      # the retry rules
+    └── test_audit.py      # audit trail, failure codes, events endpoint, log files
 ```
 
 ## Setup and running (Windows / PowerShell)
@@ -110,7 +115,7 @@ python -m pip install -r orchestrator/requirements.txt
 python -m pytest orchestrator/tests -v
 ```
 
-Expected: `63 passed`.
+Expected: `82 passed`.
 
 ### 4. Run the demo
 
@@ -184,7 +189,17 @@ tmux new -s orch-worker   # then: python -m orchestrator worker --db ~/runs
 | `POST /api/v1/runs/{run_id}/cancel` | Stop a run (body `{}`; needs an `Idempotency-Key`) |
 | `GET /api/v1/runs/{run_id}/shortlist` | Ranked results (completed runs only) |
 | `GET /api/v1/runs/{run_id}/report` | Everything about a run in one bundle |
+| `GET /api/v1/runs/{run_id}/events` | The run's audit trail: who did what, page by page (`?limit=&cursor=`) |
 | `GET /api/v1/health` | Is a worker running? |
+
+**Log files:** both programs write their messages to `runs/logs/api.log` and
+`runs/logs/worker.log` (5 MB each, keeping the last 3, so they never fill the
+disk), as well as to the screen.
+
+**When a run fails**, `GET /runs/{id}` shows why in `failure.code`:
+`DEPENDENCY_UNAVAILABLE` (a tool kept failing temporarily, all 3 attempts used),
+`TOOL_ERROR` (a tool failed permanently), `ALL_PREDICTIONS_FAILED`,
+`UNKNOWN_POLICY`, or `INTERNAL_ERROR` (a bug in our code: check the log files).
 
 ### Without activating anything
 
