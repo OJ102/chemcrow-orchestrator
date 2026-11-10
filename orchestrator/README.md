@@ -21,6 +21,7 @@ ranked shortlist. It follows the team design documents D1 and D2.
 | Doc | What it covers |
 |---|---|
 | This README | What the package is, how to set up and run it |
+| [docs/HANDOFF.md](docs/HANDOFF.md) | **Continuing in a new session?** Project state, decisions, open questions and next steps on one page |
 | [docs/primer.md](docs/primer.md) | **Start here if you're new:** chemistry words, Python features, LangGraph, and tests explained from zero |
 | [docs/spec-alignment.md](docs/spec-alignment.md) | What the team design docs (D0/D1/D2) require from the orchestrator, and where the code stands |
 | [docs/chemcrow-tools.md](docs/chemcrow-tools.md) | ChemCrow's 19 tools: what each does, whether it fits, and where it would plug into the loop |

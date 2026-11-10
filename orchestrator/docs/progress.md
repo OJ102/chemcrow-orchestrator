@@ -25,7 +25,7 @@ next. Newest entries go at the top of the **Log** section.
 | Chemistry check | 🟡 Our `validate` safety net (RDKit validity + repeated pairs) until Jaxon's C3 validation exists |
 | Web API + separate worker program (item 5) | ✅ Done (2026-11-10), 63 tests pass |
 | Retries, failure handling, audit log (item 6) | ✅ Done (2026-11-10), 82 tests pass |
-| SynSpace / ModifyMol testing | ⬜ Next |
+| SynSpace / ModifyMol testing | ✅ Done (2026-11-10): not suitable as a general near-miss repair tool (see log) |
 | MCP server | ✖ Dropped (advisor, 2026-11-06) |
 | Bounded, diverse near-miss archive | ⬜ Waiting on Jaxon's similarity measure |
 | Structured repair instructions | 🟡 Parents carry machine-readable violations; the rest waits on Jaxon |
@@ -122,6 +122,55 @@ and Validate), not a document. **The full spec-vs-code comparison is in
 spec in many places and must be reshaped before real tools are connected.
 
 ## Log
+
+### 2026-11-10 (latest): SynSpace / ModifyMol test on real OPV molecules
+**Question:** can SynSpace (`synspace` 1.0.0, MIT; the library behind ChemCrow's
+ModifyMol tool) make small, synthesizable variants of our molecules, so we could
+use it to "repair" near misses?
+
+**Setup** (decided by Shashank: throwaway venv + mixed sample):
+- Installed into a separate `.venv-synspace` (git-ignored), not `.venv-langgraph`.
+  No orchestrator code changed.
+- 12 molecules from Kyle's `classified_opv_database.csv` (2,308 donors, 1,715
+  acceptors): 6 famous ones (Y6, L8-BO, ITIC, IT-4F, PC71BM, D18) plus a small,
+  typical and large molecule of each role (10th/50th/90th percentile of heavy
+  atoms). `chemical_space()` with default settings (1 retro step + 1 forward
+  step), each run twice: REOS filter on (SynSpace default) and off.
+
+**Results**
+| Molecule | Atoms | Variants (filter on / off) | What got changed |
+|---|---|---|---|
+| Y6, L8-BO, ITIC, IT-4F, D18 | 89–108 | 0 / 0 | nothing: no reaction template matches |
+| PFO-DffBT, PBTI2(30DT)-FT | 50, 158 | 0 / 0 | nothing |
+| PC71BM | 62 | 136 / 140 | ester side chain swapped for amides/heterocycles |
+| PBDTT-FDPP | 81 | 249 / 249 | an amide N-alkyl swapped; some variants **break the DPP core ring** |
+| PDCB-Q1014 | 122 | 0 / 99 | ether side chains (2-ethylhexyl-O) swapped |
+| PNEHD | 68 | 0 / 249 | imide N-alkyl side chain swapped |
+| BTz-Np | 107 | 2 / 2 | **opens an imide ring** into an amide |
+
+Every run finished in 3–6 s with no crashes, and every variant was valid to RDKit.
+
+**What this means**
+1. **It can't touch the important molecules.** SynSpace only edits a molecule at
+   "handles" (esters, amides, imides, ethers) that its drug-chemistry reaction
+   list knows. The fused-ring acceptors and donors we care most about (Y6, ITIC,
+   IT-4F, L8-BO, D18) got **zero** variants.
+2. **When it works, it edits side chains, not the conjugated core.** The core
+   decides light absorption (so AVT and PCE). The side chains mostly change
+   solubility. It also swaps in drug-like fragments (piperidines, nitriles,
+   cyclopropyls), which are unusual in OPV materials.
+3. **Some edits break the molecule's key unit** (the DPP and naphthalimide rings
+   were opened), so the "nearby" variant is a different kind of material.
+4. **The REOS filter must be off for OPV molecules.** It rejects any chain of 7+
+   CH2 groups, which almost every OPV molecule has for solubility.
+5. **Data note for Kyle:** Y6 and L8-BO are labelled `donor` in
+   `classified_opv_database.csv`, but they are well-known acceptors.
+
+**Decision / recommendation:** don't build SynSpace into the orchestrator as
+the near-miss repair tool. Tell Jaxon the result. OPV repair needs OPV-specific
+edits (halogenation, end-group swaps, side-chain length, core/π-bridge swaps),
+done by MatGPT with structured repair instructions or by a small OPV edit
+library. The test script and results were throwaway files in the session scratchpad.
 
 ### 2026-11-10 (later): Item 6 done: retries, failure codes, audit log
 Decisions Q1–Q7 (all as recommended, Shashank 2026-11-10):
