@@ -12,6 +12,12 @@ results. Because the file is named __main__.py, running `python -m orchestrator`
     python -m orchestrator --db runs --list        # list the runs saved in runs/
     python -m orchestrator --db runs --resume ID   # continue a saved run that crashed
 
+The web API and the worker (item 5) are two separate programs, each started
+with its own command, both pointing at the same folder:
+
+    python -m orchestrator serve  --db runs --port 8100   # the web API (needs ORCHESTRATOR_API_TOKEN)
+    python -m orchestrator worker --db runs               # runs the queued runs
+
 Nothing pauses any more: uncertain candidates are SET ASIDE (escalated) and
 listed at the end, as agreed on 2026-10-22 and specified in D2.
 
@@ -21,12 +27,20 @@ listed at the end, as agreed on 2026-10-22 and specified in D2.
 # argparse: Python's standard tool for reading command-line options like --db.
 import argparse
 
+# os.environ: the environment variables (where the API token is read from).
+import os
+
+# sys.argv: the words typed after "python -m orchestrator".
+import sys
+
 # uuid: makes random unique IDs like "3f2a9c1e-...", used as the run's ID.
 import uuid
+from pathlib import Path
 
 # "from ." = from this package's __init__.py (which re-exports these names).
-from . import Policy, RunConfig, RunConstraints, Tools, build_graph
+from . import RunConfig, RunConstraints, Tools, build_graph
 from .gate import PlaceholderGate, PlaceholderRanker
+from .policies import PLACEHOLDER_POLICY
 from .runner import resume_run, start_run
 from .storage import RunStore, make_checkpointer
 from .stubs import StubGenerator, StubPredictor, StubRetriever
@@ -38,18 +52,58 @@ from .stubs import StubGenerator, StubPredictor, StubRetriever
 Y6 = ("CCCCCCCCCCCc1c(C=C2C(=O)c3cc(F)c(F)cc3C2=C(C#N)C#N)sc2c1sc1c3c4nsnc4c4c5sc6c(CCCCCCCCCCC)"
       "c(C=C7C(=O)c8cc(F)c(F)cc8C7=C(C#N)C#N)sc6c5n(CC(CC)CCCC)c4c3n(CC(CC)CCCC)c21")
 
-# PLACEHOLDER scientific limits. Nobody has approved real ones yet (peer review
-# PR-06), so these are made up to suit the fake predictor.
-DEMO_POLICY = Policy(
-    policy_version="placeholder-0",
-    opv_min=0.5,  # OPV-likeness below 0.5 -> Stop
-    # A value whose uncertainty is above these limits (or unknown) -> Escalate.
-    uncertainty_max_by_target={"avt_fraction": 0.05, "pce_percent": 1.0, "lue_percent": 0.8},
-)
+# PLACEHOLDER scientific limits (nobody has approved real ones yet, peer review
+# PR-06). Defined once in policies.py, which the web API also uses.
+DEMO_POLICY = PLACEHOLDER_POLICY
+
+
+def _fake_tools() -> Tools:
+    """The FAKE tools (stubs.py) plus the placeholder gate and ranker (gate.py)."""
+    return Tools(retriever=StubRetriever(), generator=StubGenerator(), predictor=StubPredictor(),
+                 gate=PlaceholderGate(), ranker=PlaceholderRanker())
+
+
+def serve_or_work(command: str, argv: list[str]) -> None:
+    """The two long-running programs: `serve` (the web API) and `worker`.
+
+    Both read the same --db folder: the API records runs there, the worker runs them.
+    """
+    parser = argparse.ArgumentParser(prog=f"python -m orchestrator {command}")
+    parser.add_argument("--db", default="runs", metavar="FOLDER", help="the runs folder (default: runs)")
+    if command == "serve":
+        parser.add_argument("--port", type=int, default=8100, help="port to listen on (default: 8100)")
+    else:
+        parser.add_argument("--poll", type=float, default=2.0, help="seconds between checks for new runs")
+    args = parser.parse_args(argv)
+
+    if command == "serve":
+        # The shared secret is read from an ENVIRONMENT VARIABLE, not typed on the
+        # command line, so it doesn't end up in shell history or process lists.
+        token = os.environ.get("ORCHESTRATOR_API_TOKEN")
+        if not token:
+            parser.error("set the ORCHESTRATOR_API_TOKEN environment variable to a secret first "
+                         "(PowerShell: $env:ORCHESTRATOR_API_TOKEN = '...'; bash: export ORCHESTRATOR_API_TOKEN=...)")
+        import uvicorn  # the web server program that runs a FastAPI app
+        from .api import create_app
+        print(f"API docs: http://127.0.0.1:{args.port}/docs  (only reachable from this machine)")
+        # host="127.0.0.1": only programs on THIS machine can connect (decision Q4).
+        uvicorn.run(create_app(Path(args.db), token), host="127.0.0.1", port=args.port)
+    else:
+        from .worker import Worker
+        store = RunStore(args.db)
+        # should_cancel lets a cancel request made through the API stop the run between steps.
+        graph = build_graph(_fake_tools(), checkpointer=make_checkpointer(args.db),
+                            should_cancel=store.is_cancel_requested)
+        try:
+            Worker(graph, store).run_forever(poll_every=args.poll)
+        except KeyboardInterrupt:  # Ctrl+C
+            print("worker stopped")
 
 
 def main() -> None:
     """Read the command-line options, then run (or resume, or list) and print the results."""
+    if len(sys.argv) > 1 and sys.argv[1] in ("serve", "worker"):
+        return serve_or_work(sys.argv[1], sys.argv[2:])
     parser = argparse.ArgumentParser(description="Demo of the transparent-OPV orchestrator (FAKE tools).")
     parser.add_argument("--db", metavar="FOLDER",
                         help="save runs in this folder (creates checkpoints.db and runs.db)")
@@ -62,9 +116,7 @@ def main() -> None:
     # Saving to disk (--db) or only in memory (no --db)?
     checkpointer = make_checkpointer(args.db) if args.db else None  # None = in memory
     store = RunStore(args.db) if args.db else None
-    graph = build_graph(Tools(retriever=StubRetriever(), generator=StubGenerator(),
-                              predictor=StubPredictor(), gate=PlaceholderGate(),
-                              ranker=PlaceholderRanker()), checkpointer=checkpointer)
+    graph = build_graph(_fake_tools(), checkpointer=checkpointer)
 
     if args.list:
         for r in store.list():

@@ -443,6 +443,9 @@ class OPVState(TypedDict, total=False):
     # Compared with Policy.max_runtime_seconds for the time budget. Starts at 0.
     active_seconds: Annotated[float, operator.add]
     stale_iterations: int  # rounds in a row with no near-miss progress (formula NM-4); for patience
+    cancel_seen: bool  # True once a cancel request was noticed (graph.py's should_cancel).
+    #   From then on the remaining steps are skipped and the run ends "stopped",
+    #   reason "cancelled" (decision Q6, 2026-11-08). Work done so far is kept.
     status: RunStatus  # queued / running / completed / failed / stopped
     stop_reason: str  # human-readable sentence explaining why the run ended
     ranked: list[Candidate]  # FINAL OUTPUT: accepted candidates, best first (from the ranker)

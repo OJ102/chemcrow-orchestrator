@@ -1,13 +1,16 @@
-"""Starting and resuming runs, and keeping the runs table up to date.
+"""Starting, resuming and reading runs, and keeping the runs table up to date.
 
 WHAT THIS FILE IS
 -----------------
 graph.py knows how to RUN the loop; storage.py knows how to SAVE things. This
-file connects them, giving two simple functions that the web API (item 5)
-will call:
+file connects them:
 
-  start_run(...)    - record a new run, run it, record how it ended
+  start_run(...)    - record a new run and run it straight away (the demo's --db mode)
+  run_claimed(...)  - run a run the WORKER has claimed: from the start if
+                      nothing was saved yet, otherwise resume from the last step
   resume_run(...)   - continue a run that crashed, from its last finished step
+  saved_state(...)  - read a run's saved results without running anything
+                      (the web API uses this for the shortlist and the report)
 
 Each run's run_id is used as LangGraph's thread_id (its save-slot name), as
 agreed with Nyla, so there's one ID per run.
@@ -18,13 +21,10 @@ Status flow in the runs table (D1 statuses):
   message, so it never stays stuck on "running". A failed or interrupted run
   can be resumed, which sets it back to "running".
   (Item 6 adds retries before giving up, and the audit log.)
-
-Usage:
-    from orchestrator.storage import make_checkpointer, RunStore
-    graph = build_graph(tools, checkpointer=make_checkpointer())
-    record = start_run(graph, RunStore(), objective="...", config=..., policy=...)
-    record.status   ->  e.g. "completed"
 """
+
+# Callable: the type of "something you can call like a function".
+from typing import Callable
 
 # uuid4(): a new random unique ID for each run.
 from uuid import uuid4
@@ -40,6 +40,17 @@ FINISHED = {"completed", "stopped"}
 def _thread(run_id: str) -> dict:
     """The LangGraph config that selects this run's save slot (thread_id = run_id)."""
     return {"configurable": {"thread_id": run_id}}
+
+
+def saved_state(checkpointer, run_id: str) -> dict:
+    """A run's latest saved state (the shared notebook), or {} if nothing is saved yet.
+
+    Reads straight from the checkpoint database, without building or running a
+    graph. `checkpointer.get(...)` returns the latest checkpoint, whose
+    "channel_values" are the state's keys and values.
+    """
+    checkpoint = checkpointer.get(_thread(run_id))
+    return dict(checkpoint["channel_values"]) if checkpoint else {}
 
 
 def start_run(graph, store: RunStore, *, objective: str, config: RunConfig, policy: Policy,
@@ -64,6 +75,27 @@ def start_run(graph, store: RunStore, *, objective: str, config: RunConfig, poli
     return _drive(graph, store, run_id, inputs)
 
 
+def run_claimed(graph, store: RunStore, record: RunRecord, policy: Policy,
+                still_owner: Callable[[], bool] = lambda: True) -> RunRecord:
+    """Run a run that a worker has just claimed (status "running"), to the end.
+
+    - Nothing saved yet (a fresh claim)  -> start from the beginning, using the
+      settings stored in the runs table.
+    - Something saved (a stale run taken over from a crashed worker)
+      -> RESUME from the last finished step; finished rounds aren't redone.
+
+    still_owner: a function the worker provides that returns False if another
+    worker has taken this run over (its heartbeat was refused). Then this worker
+    must NOT write the final status, because the run belongs to someone else now.
+    """
+    if saved_state(graph.checkpointer, record.run_id):
+        inputs = None  # None = "continue this save slot from its last checkpoint"
+    else:
+        inputs = {"run_id": record.run_id, "objective": record.objective,
+                  "config": record.config, "policy": policy}
+    return _drive(graph, store, record.run_id, inputs, still_owner)
+
+
 def resume_run(graph, store: RunStore, run_id: str) -> RunRecord:
     """Continue a run from its last saved step, e.g. after a crash.
 
@@ -84,20 +116,28 @@ def resume_run(graph, store: RunStore, run_id: str) -> RunRecord:
     return _drive(graph, store, run_id, None)
 
 
-def _drive(graph, store: RunStore, run_id: str, inputs) -> RunRecord:
+def _drive(graph, store: RunStore, run_id: str, inputs,
+           still_owner: Callable[[], bool] = lambda: True) -> RunRecord:
     """Run (or continue) the graph, then write the outcome into the runs table.
 
     Any error is caught and recorded as status "failed" with the error message
-    (D1: `failure` is set only for failed runs), instead of crashing the caller,
-    which will be the web API. The state saved up to the error stays in the
-    checkpoint database, so resume_run can pick up from there.
+    (D1: `failure` is set only for failed runs), instead of crashing the caller.
+    The state saved up to the error stays in the checkpoint database, so the run
+    can be resumed from there.
+
+    If still_owner() says this worker lost the run to another worker, nothing is
+    written, and the row is returned as it is.
     """
     try:
         final = graph.invoke(inputs, _thread(run_id))
     except Exception as error:  # deliberately broad: ANY error must be recorded, not lost
-        saved = graph.get_state(_thread(run_id)).values  # what was saved before the error
+        if not still_owner():
+            return store.get(run_id)
+        saved = saved_state(graph.checkpointer, run_id)  # what was saved before the error
         return store.update(run_id, status="failed", iteration=saved.get("iteration", 0),
                             failure=f"{type(error).__name__}: {error}")
+    if not still_owner():
+        return store.get(run_id)
     status = final["status"]
     return store.update(run_id, status=status, iteration=final["iteration"],
                         stop_reason=final.get("stop_reason"),

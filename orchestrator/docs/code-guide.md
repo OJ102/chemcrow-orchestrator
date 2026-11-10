@@ -19,9 +19,12 @@ Contents:
 7. [graph.py: the loop](#7-graphpy-the-loop)
 8. [storage.py: saving runs to disk](#8-storagepy-saving-runs-to-disk)
 9. [runner.py: starting and resuming runs](#9-runnerpy-starting-and-resuming-runs)
-10. [\_\_init\_\_.py and \_\_main\_\_.py](#10-__init__py-and-__main__py)
-11. [The tests](#11-the-tests)
-12. [One run, step by step](#12-one-run-step-by-step)
+10. [policies.py: approved policy versions](#10-policiespy-approved-policy-versions)
+11. [worker.py: the worker program](#11-workerpy-the-worker-program)
+12. [api.py: the web API](#12-apipy-the-web-api)
+13. [\_\_init\_\_.py and \_\_main\_\_.py](#13-__init__py-and-__main__py)
+14. [The tests](#14-the-tests)
+15. [One run, step by step](#15-one-run-step-by-step)
 
 ---
 
@@ -305,6 +308,15 @@ g.add_node(name, timed(fn))
 Time *between* steps, such as a machine being off overnight after a crash, is
 never added, so a resumed run isn't stopped for downtime.
 
+**The middle steps can be cancelled** (D2: "cancellation is observed at each
+checkpoint"). `build_graph(..., should_cancel=...)` takes a function that answers
+"has someone asked run X to stop?" (the worker passes `RunStore.is_cancel_requested`).
+`retrieve`, `generate`, `validate`, `predict` and `decide` are wrapped by
+`cancellable`: once a cancel is seen, they do nothing except record
+`cancel_seen: True`, and `_next_move` rule 0 sends the run to `finish` as
+`stopped` / `"cancelled"`. `start` and `finish` always run. Work finished
+before the cancel is kept.
+
 ### The steps (nodes)
 | Node | Reads | Writes | What it does |
 |---|---|---|---|
@@ -339,6 +351,7 @@ next round retries them (D2 EC-C3-1).
 ### How a run ends: `_next_move` (rules in order)
 | # | Condition | Result |
 |---|---|---|
+| 0 | a cancel request was noticed | **stopped** (`cancelled`) |
 | 1 | valid candidates existed but every prediction failed | **failed** |
 | 2 | optional `target_count` reached | **completed** |
 | 3 | working-time budget used up (`active_seconds` ≥ `policy.max_runtime_seconds`) | **stopped** |
@@ -385,9 +398,23 @@ def make_checkpointer(runs_dir=DEFAULT_RUNS_DIR) -> SqliteSaver:
 - Values are always passed to SQL through `?` placeholders, never pasted into
   the SQL text (that prevents "SQL injection").
 
-**Deferred** (decision Q4, answering peer review PR-03): D2's worker leases and
-fencing tokens (needed only with several workers), and idempotency receipts
-(item 5, for repeated web requests).
+**Added for item 5 (2026-11-09):** `runs.db` has three tables:
+`runs` (plus the columns `knowledge_snapshot_id`, `model_version`, `cancel_requested`,
+`claimed_by`, `heartbeat_at`; an older `runs.db` gets them added automatically, a
+"migration"), `receipts` (idempotency, 24 h) and `workers` (last seen).
+
+| Method | Used by | What it does |
+|---|---|---|
+| `claim_next(worker)` | worker | Claims the oldest queued run in ONE SQL statement that only succeeds if it's still queued |
+| `claim_stale(worker, after)` | worker | Takes over a running run whose heartbeat is older than `after` (its worker crashed) |
+| `heartbeat(run, worker)` | worker | "Still working on it"; returns False if another worker has taken the run |
+| `request_cancel(run)` | API | Sets `cancel_requested`; a still-queued run is stopped at once |
+| `create_with_receipt(...)` | API | Creates the run AND its idempotency receipt in one transaction |
+| `find_receipt` / `save_receipt` | API | Look up / store the first reply to a POST |
+| `worker_seen` / `last_worker_seen` | worker / API | "I'm alive" / "when was a worker last alive?" |
+
+**Still deferred:** D2's full leases with fencing tokens. The heartbeat and
+`claimed_by` checks are a lighter version, enough for one worker.
 
 ---
 
@@ -404,13 +431,94 @@ record = resume_run(graph, store, run_id)                                 # cont
   (`completed`/`stopped`). Otherwise it sets the status back to `running` and
   calls `graph.invoke(None, config)`. `None` means "continue from the last
   checkpoint", so finished rounds aren't redone.
+- **`run_claimed(graph, store, record, policy, still_owner)`**: what the worker
+  calls. If nothing is saved for the run yet, it starts from the beginning using
+  the settings stored in the runs table; if something is saved (a stale run
+  taken over), it resumes. If `still_owner()` says another worker took the run,
+  the result is **not** written.
+- **`saved_state(checkpointer, run_id)`**: a run's latest saved state, read
+  straight from the checkpoint database without running anything (used by the
+  API for the shortlist, the report and live iteration).
 - **`_drive`**: if the graph throws **any** error, the run is recorded as
   `failed` with `"ErrorType: message"` in `failure` and the last saved
   iteration, instead of crashing the caller. Retries before giving up come in item 6.
 
 ---
 
-## 10. `__init__.py` and `__main__.py`
+## 10. `policies.py`: approved policy versions
+
+A run stores only the **name** of its policy (`policy_version`, e.g.
+`"placeholder-0"`). `POLICIES` maps names to `Policy` objects. D2: policies never
+change once registered, so new limits get a new name. The API refuses an
+unknown name (422), and the worker looks the policy up again when it runs.
+Only `PLACEHOLDER_POLICY` exists (no real limits approved yet: PR-06).
+
+---
+
+## 11. `worker.py`: the worker program
+
+Decision Q2 (2026-11-08): runs execute in a separate program, not inside the API.
+
+```python
+def process_next_run(self):
+    self.store.worker_seen(self.worker_id)                                # "I'm alive"
+    record = (self.store.claim_stale(self.worker_id, self.stale_after)    # crashed runs first
+              or self.store.claim_next(self.worker_id))                   # then the oldest queued run
+    ...
+    with Heartbeat(self.store.runs_dir, record.run_id, self.worker_id, self.heartbeat_every) as beat:
+        return run_claimed(self.graph, self.store, record, policy, still_owner=lambda: not beat.lost)
+```
+- **`Heartbeat`**: a background **thread** that calls `store.heartbeat(...)`
+  every 20 s (D2) on its **own** database connection. If a heartbeat is refused,
+  `lost` becomes True.
+- **`run_forever(poll_every)`**: repeats `process_next_run`, waiting `poll_every`
+  seconds when there's nothing to do. Prints one line per finished run.
+- Timings: heartbeat every 20 s, stale after 60 s (D2's lease numbers), poll every 2 s.
+
+---
+
+## 12. `api.py`: the web API
+
+`create_app(runs_dir, api_token, policies)` builds a FastAPI app. `serve` runs it
+with uvicorn on **127.0.0.1 only**.
+
+| Endpoint | Source | Notes |
+|---|---|---|
+| `POST /api/v1/runs` | D1 | → `202 {run_id, status: "queued", created_at}` + `Location` header. Needs `Idempotency-Key` |
+| `GET /api/v1/runs?status=&limit=` | Nyla | newest first; `limit` 1–100 |
+| `GET /api/v1/runs/{run_id}` | D1 | D1's Run shape + `stop_reason`, `cancel_requested`; live iteration while running |
+| `POST /api/v1/runs/{run_id}/cancel` | D2 | body `{}`; → `202`; ended run → `409 RUN_CLOSED` |
+| `GET /api/v1/runs/{run_id}/shortlist?limit=` | D1 | completed runs only, else `409 RESULTS_NOT_READY` |
+| `GET /api/v1/runs/{run_id}/report` | Nyla | every candidate in full + id lists + pinned versions + `not_yet_available` |
+| `GET /api/v1/health` | ours | `worker_online` = a worker seen in the last 60 s |
+
+**`CreateRunRequest`**: D1's fields plus our additions: `target_type` and
+`fixed_partner_smiles` (**required**: a run can't happen without them; by D1's
+own rule this is a breaking change, so D1 must be updated), and optional
+`objective`, `target_count` and `patience`.
+
+**Errors** are always D1's format (`{"error": {code, message, details}, "request_id"}`):
+`ApiError` for our own checks; FastAPI's validation errors become `422` (or
+`400 MALFORMED_JSON` when the body isn't JSON); oversized bodies are `413` and
+non-JSON content types `415` (middleware); a busy database is `503`; anything
+unexpected is `500` without internal details.
+
+**Security**: `HTTPBearer` reads `Authorization: Bearer <token>`, compared with
+`secrets.compare_digest` (constant time). The token comes from the
+`ORCHESTRATOR_API_TOKEN` environment variable. Declaring it with `HTTPBearer`
+also gives the `/docs` page its **Authorize** button.
+
+**Idempotency**: the receipt is looked up first. Same key + same body → the
+stored reply; different body → `409 CONFLICT`. A new run and its receipt are
+saved in one transaction, so even two identical requests at the same instant
+create one run.
+
+Each request gets its **own** `RunStore` connection (`get_store`), closed
+afterwards, because the server answers requests on several threads.
+
+---
+
+## 13. `__init__.py` and `__main__.py`
 
 `__init__.py` re-exports the public names (`build_graph`, `Tools`, `RunConfig`,
 `Policy`, ...), so callers can write `from orchestrator import ...`.
@@ -426,11 +534,15 @@ Options: `--db FOLDER` saves the run (through `runner.start_run`);
 `--db FOLDER --list` lists saved runs; `--db FOLDER --resume RUN_ID` continues
 one. Asking to resume an unknown or finished run prints a one-line error.
 
+`python -m orchestrator serve --db FOLDER --port 8100` starts the API (it refuses
+to start unless `ORCHESTRATOR_API_TOKEN` is set). `python -m orchestrator worker
+--db FOLDER` starts the worker with the fake tools and cancellation wired up.
+
 ---
 
-## 11. The tests
+## 14. The tests
 
-Run: `python -m pytest orchestrator/tests -v` (from the repo root, langgraph venv). 35 tests.
+Run: `python -m pytest orchestrator/tests -v` (from the repo root, langgraph venv). 63 tests.
 
 **`fakes.py`** (shared helpers, not tests):
 ```python
@@ -450,10 +562,12 @@ def run(batches, table=None, default=GOOD, clock=None, **config_changes): ...
 | `test_near_miss.py` | NM-1 and NM-2 numbers from the running example; the borderline flag; NM-3 including a trade-off; NM-4 (first round, closer, equal, worse, Accept); near-miss ranking ignores Accepts and Escalates |
 | `test_graph.py` | completes when nothing is left to revise; parents with violations reach the generator and lineage is recorded; stops at the iteration budget; all-failed → failed; time budget (fake clock); escalate sets aside without pausing; the validate safety net catches invalid and repeated molecules; a failed prediction is logged; the optional rules are off by default; `target_count` and `patience` work; an invalid partner is rejected |
 | `test_storage.py` | a finished run survives a restart (brand-new saver, graph and store read it back); reloading logs no "unregistered type" message; a crash mid-run is recorded as `failed` with the error and resume finishes it without redoing round 1; **downtime doesn't count** against the time budget; resume refuses finished and unknown runs; the runs table creates, updates, gets and lists runs and refuses bad columns, unknown runs and invalid statuses |
+| `test_worker.py` | nothing queued → nothing done; a queued run is claimed and run to the end; oldest first; unknown policy → failed; **cancel during round 2** stops before the next step and keeps round 1; cancelling a queued run needs no worker; a **stale run is taken over and resumed** without redoing round 1; the heartbeat notices a takeover; a worker that lost the run doesn't overwrite its status |
+| `test_api.py` | token required (401); create → 202 + Location; same key + same body → same run (only one created); same key + different body → 409; missing key → 422; six invalid bodies → 422 naming the field; not JSON → 400; wrong content type → 415; unknown run → 404, malformed ID → 422; list with filters; results not ready while queued → 409; **full lifecycle** API → worker → shortlist, report, health; cancel → stopped/cancelled, repeat with same key → same reply, new cancel → 409 RUN_CLOSED; cancel body must be `{}` |
 
 ---
 
-## 12. One run, step by step
+## 15. One run, step by step
 
 Using `test_revise_rounds_pass_parents_and_stop_at_the_iteration_budget`
 (batches `["c1ccccc1"]`, `["Cc1ccccc1"]`, `["CCc1ccccc1"]`; every prediction

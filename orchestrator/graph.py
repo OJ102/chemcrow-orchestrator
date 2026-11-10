@@ -66,7 +66,8 @@ from .storage import make_serializer
 RDLogger.DisableLog("rdApp.*")
 
 
-def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = time.time):
+def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = time.time,
+                should_cancel: Callable[[str], bool] | None = None):
     """Build the flowchart around the given tools and return a runnable graph.
 
     Parameters:
@@ -78,6 +79,11 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
                        time.time. Tests pass a fake clock so they can pretend 30
                        minutes have passed without actually waiting. Used only to
                        time each step (see `timed` below).
+        should_cancel - optional function: given a run_id, returns True if someone
+                       asked that run to stop (the worker passes
+                       RunStore.is_cancel_requested). Checked before every step
+                       (D2: "cancellation is observed at each checkpoint").
+                       None = the run can't be cancelled (demo, most tests).
 
     Returns a compiled graph. Run it with:
         graph.invoke({"run_id": ..., "objective": ..., "config": ..., "policy": ...},
@@ -110,6 +116,21 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
             # {**updates, ...} = a copy of the step's updates plus one more key.
             return {**updates, "active_seconds": clock() - began}
         return run_and_time
+
+    def cancellable(step):
+        """Wrap a step so it's SKIPPED once the run has been asked to stop.
+
+        Before the step runs, check (1) whether a cancel was already noticed, or
+        (2) whether should_cancel says this run must stop. If so, do no work and
+        just record {"cancel_seen": True}. Every remaining step is then skipped
+        the same way until the routing sends the run to `finish`, which ends it
+        as stopped / "cancelled". Steps that already finished keep their results.
+        """
+        def run_unless_cancelled(state: OPVState) -> dict:
+            if state.get("cancel_seen") or (should_cancel and should_cancel(state["run_id"])):
+                return {"cancel_seen": True}
+            return step(state)
+        return run_unless_cancelled
 
     def start(state: OPVState) -> dict:
         """FIRST STEP, once per run: set every counter to its starting value.
@@ -274,6 +295,7 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
         """Decide what happens after a round. Returns (next_node, final_status, reason).
 
         final_status and reason only matter when next_node is "finish". Rules, in order:
+          0. a cancel request was noticed                          -> stopped ("cancelled")
           1. valid candidates existed but EVERY prediction failed  -> failed
           2. optional target_count reached                         -> completed
           3. WORKING-time budget used up (policy.max_runtime_seconds) -> stopped
@@ -294,6 +316,8 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
         unrevised = [c for c in batch if c.decision is not None and c.decision.outcome == "Stop"
                      and c.decision.violations]
 
+        if state.get("cancel_seen"):
+            return "finish", "stopped", "cancelled"
         if valid and not any_ok:
             return "finish", "failed", f"every prediction failed in iteration {state['iteration']}"
         if cfg.target_count is not None and len(state.get("accepted", [])) >= cfg.target_count:
@@ -320,9 +344,12 @@ def build_graph(tools: Tools, checkpointer=None, clock: Callable[[], float] = ti
     # WIRING: put the steps into a flowchart and connect them with arrows.
     # ======================================================================
     g = StateGraph(OPVState)  # an empty flowchart whose notebook has the OPVState shape
-    for name, fn in [("start", start), ("retrieve", retrieve), ("generate", generate),
-                     ("validate", validate), ("predict", predict), ("decide", decide),
-                     ("finish", finish)]:
+    # The middle steps can be skipped by a cancel. `start` (which sets up the
+    # counters) and `finish` (which records how the run ended) always run.
+    steps = [("start", start)] + [(name, cancellable(fn)) for name, fn in [
+        ("retrieve", retrieve), ("generate", generate), ("validate", validate),
+        ("predict", predict), ("decide", decide)]] + [("finish", finish)]
+    for name, fn in steps:
         g.add_node(name, timed(fn))  # register each step (wrapped so it's timed) under a name
 
     # Fixed arrows: the straight-line part.

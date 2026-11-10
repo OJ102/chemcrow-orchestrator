@@ -3,4 +3,7 @@ langgraph-checkpoint-sqlite>=3.1
 langchain-core>=1.6
 pydantic>=2.13
 rdkit>=2026.9
+fastapi>=0.162
+uvicorn>=0.54
 pytest>=9.1
+httpx>=0.28

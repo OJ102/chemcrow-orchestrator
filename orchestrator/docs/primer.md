@@ -11,6 +11,7 @@ Contents:
 4. [Saving to disk: databases in plain language](#4-saving-to-disk-databases-in-plain-language)
 5. [LangGraph in plain language](#5-langgraph-in-plain-language)
 6. [How tests work (pytest)](#6-how-tests-work-pytest)
+7. [Web APIs and the worker in plain language](#7-web-apis-and-the-worker-in-plain-language)
 
 ---
 
@@ -314,3 +315,34 @@ code, a test fails and tells them immediately.
   messages, so a test can check a warning was or wasn't printed.
 - **A fake clock** (`FakeClock` in `fakes.py`) lets a test pretend hours have
   passed without waiting.
+
+---
+
+## 7. Web APIs and the worker in plain language
+
+| Word | Plain meaning |
+|---|---|
+| **Web API** | Web addresses that *programs* (like Nyla's dashboard) send requests to, instead of people visiting pages |
+| **Endpoint** | One of those addresses plus a method, e.g. `GET /api/v1/runs/{run_id}` |
+| **`GET` / `POST`** | `GET` = "give me information" (never changes anything); `POST` = "do something / create something" |
+| **JSON** | The text format for the data sent and received, e.g. `{"status": "queued"}` |
+| **Status code** | A number in every reply. `200` OK, `202` accepted (started, not finished), `400` not valid JSON, `401` wrong/missing token, `404` not found, `409` conflict (e.g. the run already ended), `415` not JSON, `422` invalid values, `500` our bug, `503` database busy/unavailable |
+| **Header** | Extra labelled information sent with a request, e.g. `Authorization: Bearer <token>`, `Idempotency-Key: <uuid>` |
+| **Token** | A shared secret proving the caller is allowed in. We read it from the environment variable `ORCHESTRATOR_API_TOKEN` so it's never typed on the command line |
+| **`127.0.0.1`** | "This machine". A server listening only there can't be reached from other computers |
+| **Idempotency key** | A random ID the caller sends with a `POST`. If the same request arrives twice (a network hiccup, a double-click), the API recognises the key and returns the first reply instead of acting twice |
+| **Polling** | Asking "is it done yet?" every few seconds. The dashboard polls `GET /runs/{id}`; the worker polls the database for queued runs |
+| **FastAPI** | The Python library our API is built with. It reads pydantic models for requests and replies, and makes the interactive docs page at `/docs` |
+| **uvicorn** | The program that actually runs a FastAPI app as a server |
+| **Middleware** | Code that runs around *every* request, e.g. giving it an ID and refusing oversized bodies |
+| **Worker** | The separate program that runs the queued runs (the API only records them) |
+| **Claiming** | A worker marking a queued run as "mine". One database operation that succeeds only if the run is still queued, so two workers can't both take it |
+| **Heartbeat** | The worker writing "still working on it" every few seconds. A run whose heartbeat has gone quiet (60 s) belonged to a crashed worker and can be taken over |
+| **Thread** | A second line of work inside one program. The heartbeat runs in its own thread while the run works. One database connection must not be shared by two threads at once, so each thread opens its own |
+| **`tmux`** | A Linux tool that keeps a terminal session running after you disconnect from the cluster |
+
+The flow, end to end:
+```
+dashboard ──POST /runs──> API ──"queued" row──> runs.db <──claims, heartbeats── worker ──runs──> checkpoints.db
+dashboard <──GET /runs/{id}, /shortlist, /report── API <──reads──────────────── runs.db + checkpoints.db
+```

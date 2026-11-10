@@ -7,12 +7,13 @@ half of a donor:acceptor pair against a fixed partner molecule, revises the
 near misses, sets aside uncertain candidates for DFT/lab review, and returns a
 ranked shortlist. It follows the team design documents D1 and D2.
 
-> **Status (2026-11-06):** the loop follows the D1 data shapes and D2 run
-> behaviour, and runs can be **saved to disk and resumed after a crash**. The
-> retriever, generator and predictor are **fakes that produce made-up
-> numbers**, and the gate and ranker are **placeholders** written to D2's rules.
-> Next: the web API (item 5), then retries, failure handling and the audit log
-> (item 6). See [docs/progress.md](docs/progress.md).
+> **Status (2026-11-10):** the loop follows the D1 data shapes and D2 run
+> behaviour; runs are **saved to disk and resumable**; and there's a **web API**
+> (D1/D2 endpoints plus Nyla's list and report) with a separate **worker
+> program** that runs queued runs. The retriever, generator and predictor are
+> **fakes that produce made-up numbers**, and the gate and ranker are
+> **placeholders** written to D2's rules. Next: retries, failure handling and
+> the audit log (item 6). See [docs/progress.md](docs/progress.md).
 
 ## Documentation
 
@@ -53,8 +54,11 @@ orchestrator/
 ├── gate.py            # PLACEHOLDER gate (Arleen's) and ranker (Nyla's), following D2
 ├── stubs.py           # FAKE retriever, generator and predictor
 ├── graph.py           # the LangGraph workflow (nodes, routing, end conditions)
-├── storage.py         # saving to disk: checkpoint database + our runs table (SQLite)
-├── runner.py          # start_run / resume_run: run the graph and keep the runs table up to date
+├── storage.py         # saving to disk: checkpoint database + runs/receipts/workers tables (SQLite)
+├── runner.py          # start/resume/run-claimed runs, read saved results, keep the runs table up to date
+├── policies.py        # registry of approved policy versions (only a placeholder so far)
+├── worker.py          # the WORKER program: claims queued runs, heartbeats, recovers crashed runs
+├── api.py             # the WEB API (FastAPI): D1/D2 endpoints + Nyla's list and report
 ├── requirements.txt   # dependencies for the langgraph venv
 ├── docs/              # primer, spec alignment, code guide, progress log
 └── tests/
@@ -62,7 +66,9 @@ orchestrator/
     ├── test_gate.py       # gate and ranker rules
     ├── test_near_miss.py  # formulas NM-1 .. NM-4
     ├── test_graph.py      # the whole loop
-    └── test_storage.py    # saving, reloading after a restart, crash + resume, runs table
+    ├── test_storage.py    # saving, reloading after a restart, crash + resume, runs table
+    ├── test_worker.py     # claiming, cancelling, stale-run takeover, heartbeats
+    └── test_api.py        # every endpoint, error format, token, idempotency
 ```
 
 ## Setup and running (Windows / PowerShell)
@@ -104,7 +110,7 @@ python -m pip install -r orchestrator/requirements.txt
 python -m pytest orchestrator/tests -v
 ```
 
-Expected: `35 passed`.
+Expected: `63 passed`.
 
 ### 4. Run the demo
 
@@ -136,6 +142,49 @@ python -m orchestrator --db runs --resume RUN_ID # continue a saved run that cra
 after every step) and `runs.db` (one row per run). The folder is ignored by git.
 Delete it to remove all saved runs. A run that finished normally can't be
 resumed; you'll get a one-line message saying so.
+
+### 6. Run the web API and the worker
+
+These are **two programs** that run at the same time, in two terminals, both
+pointing at the same runs folder. The API records runs; the worker runs them.
+
+**Terminal 1, the API.** First set the shared secret token (pick your own
+value; anyone calling the API must send it):
+
+```powershell
+$env:ORCHESTRATOR_API_TOKEN = "choose-a-long-random-secret"
+python -m orchestrator serve --db runs --port 8100
+```
+
+**Terminal 2, the worker:**
+
+```powershell
+python -m orchestrator worker --db runs
+```
+
+Then open **http://127.0.0.1:8100/docs** in a browser. It lists every
+endpoint and lets you try them. Click **Authorize** (top right) and paste your
+token first (just the token; the page adds "Bearer" itself). The server only accepts connections from the same
+machine. Stop either program with **Ctrl+C**.
+
+**On the cluster** (Linux), run each one inside `tmux` so it keeps running
+after you disconnect:
+
+```bash
+tmux new -s orch-api      # then: export ORCHESTRATOR_API_TOKEN=...; python -m orchestrator serve --db ~/runs
+                          # detach with Ctrl+B then D; come back with: tmux attach -t orch-api
+tmux new -s orch-worker   # then: python -m orchestrator worker --db ~/runs
+```
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/v1/runs` | Start a run → `202 {run_id, status: "queued"}` (needs an `Idempotency-Key` header) |
+| `GET /api/v1/runs?status=&limit=` | List runs, newest first |
+| `GET /api/v1/runs/{run_id}` | One run's status, settings, failure |
+| `POST /api/v1/runs/{run_id}/cancel` | Stop a run (body `{}`; needs an `Idempotency-Key`) |
+| `GET /api/v1/runs/{run_id}/shortlist` | Ranked results (completed runs only) |
+| `GET /api/v1/runs/{run_id}/report` | Everything about a run in one bundle |
+| `GET /api/v1/health` | Is a worker running? |
 
 ### Without activating anything
 

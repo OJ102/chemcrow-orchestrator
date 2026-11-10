@@ -23,8 +23,8 @@ next. Newest entries go at the top of the **Log** section.
 | Escalate = set aside (no pause) | ✅ Done |
 | Near misses kept and ranked (NM-1..NM-4) | ✅ Done |
 | Chemistry check | 🟡 Our `validate` safety net (RDKit validity + repeated pairs) until Jaxon's C3 validation exists |
-| Web API (`POST /runs`, `GET /runs/{id}`, cancel) + pinned versions (item 5) | ⬜ Next |
-| Retries, failure handling, audit log (item 6) | ⬜ |
+| Web API + separate worker program (item 5) | ✅ Done (2026-11-10), 63 tests pass |
+| Retries, failure handling, audit log (item 6) | ⬜ Next |
 | SynSpace / ModifyMol testing | ⬜ After items 5–6 |
 | MCP server | ✖ Dropped (advisor, 2026-11-06) |
 | Bounded, diverse near-miss archive | ⬜ Waiting on Jaxon's similarity measure |
@@ -122,6 +122,53 @@ and Validate), not a document. **The full spec-vs-code comparison is in
 spec in many places and must be reshaped before real tools are connected.
 
 ## Log
+
+### 2026-11-10: Item 5 done: web API + worker program
+- **`api.py`** (new, FastAPI): `POST /runs` (202 + Location; Idempotency-Key),
+  `GET /runs` (Nyla), `GET /runs/{id}`, `POST /runs/{id}/cancel` (D2),
+  `GET /runs/{id}/shortlist`, `GET /runs/{id}/report` (Nyla), `GET /health`.
+  D1 error format everywhere (400/401/404/409/413/415/422/503/500). Bearer
+  token via `HTTPBearer` (so `/docs` has an Authorize button); listens on
+  127.0.0.1 only.
+- **`worker.py`** (new): claims the oldest queued run (stale runs first), sends
+  heartbeats from a background thread, resumes runs whose worker died, and
+  doesn't overwrite a run another worker took over.
+- **`policies.py`** (new): the policy registry (placeholder only).
+- **`storage.py`**: `receipts` and `workers` tables; worker/cancel columns on
+  `runs`, with automatic migration of an item-4 `runs.db`; claim, stale-claim,
+  heartbeat, cancel, receipt methods. **`runner.py`**: `run_claimed`,
+  `saved_state`. **`graph.py`**: `should_cancel`, checked before each middle
+  step. **`__main__.py`**: `serve` and `worker` commands.
+- **Tests: 63 pass** (9 in `test_worker.py`, 19 in `test_api.py`). Also ran the
+  real server and worker as two programs and used the API like the dashboard
+  would: create → worker ran it → status, report, health all correct; `/docs`
+  loads; no token → 401.
+- Fixed while testing: the worker's log lines could be lost (now flushed
+  immediately); the docs page couldn't send the token (switched to `HTTPBearer`).
+- **For the team:** (1) `target_type` and `fixed_partner_smiles` are
+  **required** in `POST /runs`. A run can't happen without them, and by D1's own
+  rule adding a required field is a breaking change, so D1 should be updated.
+  (2) D1 says only **completed** runs have a shortlist. The demo run ends
+  `stopped` (iteration budget) with 7 accepted molecules, so `/shortlist` returns
+  409 for it; the accepted molecules are still in `/report`. Should a run that
+  hits its iteration limit with accepted candidates count as completed, or
+  should stopped runs have a shortlist too?
+
+### 2026-11-08: Item 5 (web API) decisions
+- Q1: **FastAPI** (installed with `uvicorn` into `.venv-langgraph`).
+- Q2: runs execute in a **separate worker program** that picks queued runs
+  from the database (Shashank's choice over a background thread). Its
+  challenges were explained before building.
+- Q3: `POST /runs` accepts **`target_type` and `fixed_partner_smiles`** in
+  addition to D1's fields. Shashank will tell the team. `knowledge_snapshot_id`
+  and `model_version` are format-checked and stored (pinned), but can't be
+  verified until registries exist.
+- Q4: server listens on **127.0.0.1 only**, plus a **shared API token** header;
+  proper user accounts deferred.
+- Q5: **Idempotency-Key** built as D1 specifies (24 h, same key + same body →
+  same reply, different body → 409).
+- Q6: cancelled runs end as **`stopped`** with stop reason **`cancelled`**.
+- Q7: include Nyla's **`GET /runs`** list and **`GET /runs/{id}/report`** now.
 
 ### 2026-11-06 (later): Item 4 done: runs saved to disk and resumable
 - **`storage.py`** (new): `make_checkpointer` (LangGraph's SQLite auto-save,
