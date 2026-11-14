@@ -8,6 +8,8 @@ the ChemCrow tool-calling evaluation. Set up and first tested 2026-11-14.
 | [setup_vllm.sh](setup_vllm.sh) | One-time setup: Python venv, vLLM, and the model download (all in `~/llm`) |
 | [serve_vllm.sh](serve_vllm.sh) | Starts the model server on **GPU 2** (every setting is explained in comments) |
 | [smoke_test.py](smoke_test.py) | Quick "is it alive and can it call tools?" check |
+| [opv_tools.py](opv_tools.py) | 4 **real** tools over Kyle's 4,023 OPV molecules (look up, most similar, properties, compare) |
+| [agent.py](agent.py) | **Multi-step tool calling**: each tool result is fed back so the model can pick the next call |
 
 The copies that actually run live on the cluster in `~/llm/` (= `/home2/sathiysk/llm`).
 After editing a script here, copy it over again (see "Updating a script" below).
@@ -16,7 +18,11 @@ After editing a script here, copy it over again (see "Updating a script" below).
 
 ```
 ~/llm/
-├── venv/          Python 3.12 environment: vLLM 0.33.0, transformers 5.23, torch 2.14 (15 GB)
+├── venv/          the SERVER's Python 3.12 environment: vLLM 0.33.0, transformers 5.20, torch 2.14 (15 GB).
+│                  Install nothing else here: other packages can upgrade numpy past what vLLM accepts.
+├── agent-venv/    the AGENT's environment: openai, rdkit, pandas
+├── data/          classified_opv_database.csv (Kyle's molecule list)
+├── opv_tools.py, agent.py
 ├── hf/            the downloaded model Qwen/Qwen3.8-27B, BF16 (70 GB)
 ├── .api_key       the server's password (random; only readable by sathiysk)
 ├── logs/          setup.log, vllm.log
@@ -104,6 +110,68 @@ tools offered: `molecular_weight` and `patent_check`):
   real eval.
 - One easy question proves the plumbing works, **not** that the model is good at
   tool choice. That's what the eval (next step) measures.
+
+## Multi-step tool calling (agent.py)
+
+**What it does:** the model gets a question and 4 real tools. Whenever it asks for
+a tool, *our code* runs it and sends the result back, and the model uses that
+result to choose its next call. This repeats until it answers. Our code stays in
+charge: at most **8 model turns** and **3 tool errors** per question, then the
+model must answer with what it has. Errors (e.g. an unknown name) go back to the
+model with suggestions, so it can fix its call.
+
+**Optimized for a small model** (Om's guidance):
+- Tools pass short **names** (`"Y6"`), never 100+-character SMILES the model could mistype.
+- Names match forgivingly (`y-6` = `Y6`), and unknown names come back with the
+  5 closest names.
+- 4 tools only, with short descriptions; 5 short numbered rules in the system prompt.
+- A fixed random seed, so the same question gives the same run (repeatable demos).
+
+**Run it** (the server must be running):
+
+```powershell
+ssh uc-gpu 'cd ~/llm && ~/llm/agent-venv/bin/python agent.py'                    # 4 demo questions
+ssh uc-gpu 'cd ~/llm && ~/llm/agent-venv/bin/python agent.py --think'            # model reasons first
+ssh uc-gpu 'cd ~/llm && ~/llm/agent-venv/bin/python agent.py -q "Is ITIC more similar to Y6 or to IT-4F?"'
+```
+
+> **Before presenting:** run it once first. The first start after a while can
+> take a minute or more, because Python loads RDKit and pandas from the network
+> drive. The model itself answers each question in about 3–15 s.
+
+**Demo results (2026-11-14, thinking off)**: every answer is correct, from real data:
+
+```
+QUESTION: Find the 3 acceptors most similar to Y6, then tell me which of those 3 has the highest molecular weight.
+  step 1  -> most_similar({"name": "Y6", "role": "acceptor", "k": 3})
+           <- EH-HD4F 0.975, SY2 0.939, BT-L4F 0.938
+  step 2  -> properties({"name": "EH-HD4F"})   <- molecular_weight 1564.2
+  step 2  -> properties({"name": "SY2"})       <- molecular_weight 1484.9
+  step 2  -> properties({"name": "BT-L4F"})    <- molecular_weight 1552.1
+  ANSWER: ... EH-HD4F has the highest molecular weight at 1564.2 g/mol (vs. BT-L4F at 1552.1 and SY2 at 1484.9).
+  [3 model calls, 4 tool calls, 0 errors, 8.8s]
+
+QUESTION: How many aromatic rings does IT-4FF have? I may have misspelled the name; if so, use the closest match.
+  step 1  -> find_molecule({"name": "IT-4FF"})
+           <- ERROR No molecule named 'IT-4FF'. Closest names: ['IT-4F', 'IT6-4F', ...]
+  step 2  -> properties({"name": "IT-4F"})      <- aromatic_rings 11
+  ANSWER: There's no molecule named "IT-4FF"; the closest match is IT-4F (an acceptor), which has 11 aromatic rings.
+  [3 model calls, 2 tool calls, 1 errors, 4.3s]
+```
+
+**How to explain it:**
+- **Step 2 uses step 1's output:** the model only knew the names `EH-HD4F`,
+  `SY2`, `BT-L4F` because the first tool returned them. That's sequential tool
+  calling. Several calls with the same step number were requested together, in one
+  model turn (the model asked for all three properties at once).
+- **Error recovery:** the tool's error is fed back like any result. The model read
+  the suggestions and retried with the right name. Without "use the closest
+  match" in the question, it instead refuses to guess and asks which one you
+  meant. That's the safer behavior for research.
+- **Thinking on vs off:** both got every question right. Thinking took about
+  2× longer (9–17 s vs 4–9 s per question), so **off is the better default**
+  here. The real eval will test this on many more questions.
+- Every run is saved as a full transcript in `~/llm/logs/agent/` (JSON).
 
 ## Settings to remember
 

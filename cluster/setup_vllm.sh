@@ -33,7 +33,12 @@ source "$LLM/venv/bin/activate"
 #    PyTorch build that matches this machine's CUDA driver.
 pip install -q -U pip uv
 uv pip install -U "vllm>=0.17.0" --torch-backend auto
-uv pip install -U "transformers>=5.8.0"
+# transformers: >= 5.8 for this model (recipe), but within the range vLLM 0.33 accepts
+# (an unpinned upgrade gave 5.23, which vLLM 0.33 doesn't support; fixed 2026-11-14).
+uv pip install "transformers>=5.8.0,<5.21"
+uv pip check  # prints a warning if any package versions disagree
+# NOTE: don't install other packages (rdkit, pandas, ...) into this venv: they can
+# upgrade numpy past what vLLM accepts. The agent has its own venv, ~/llm/agent-venv.
 python -c "import vllm, transformers, torch; print('vllm', vllm.__version__, '| transformers', transformers.__version__, '| torch', torch.__version__, '| cuda ok:', torch.cuda.is_available())"
 
 # 3. Download the model (resumes if interrupted). hf = Hugging Face's command-line tool.

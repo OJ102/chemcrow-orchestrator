@@ -123,6 +123,25 @@ spec in many places and must be reshaped before real tools are connected.
 
 ## Log
 
+### 2026-11-14 (evening): Multi-step tool calling works
+- Shashank: feed each tool's result into the next call (sequential tool
+  calling), presentable. Decisions: **real tools** over Kyle's molecule list;
+  install RDKit + pandas on the cluster.
+- `cluster/opv_tools.py`: `find_molecule`, `most_similar`, `properties`,
+  `compare`. Tools take **names, not SMILES** (a small model would mistype
+  100+-character SMILES), with forgiving name matching and did-you-mean errors.
+- `cluster/agent.py`: the loop (max 8 model turns, max 3 tool errors, errors fed
+  back with hints, fixed seed, JSON transcript per run).
+- Results: all 4 demo questions correct, with chaining (similar → properties of
+  each), parallel calls, and error recovery (`IT-4FF` → retried as `IT-4F`).
+  Thinking on was about 2× slower with the same results, so default off.
+- Fix: installing pandas into the vLLM venv had upgraded numpy past vLLM's
+  limit, and transformers 5.23 was also too new. Restored (numpy 2.3.5,
+  transformers 5.20.2; `uv pip check` clean). The agent now has its own
+  `~/llm/agent-venv`; setup_vllm.sh pins transformers.
+- Next: the real tool-choice eval (many questions with expected tool
+  sequences) to measure what helps the small model.
+
 ### 2026-11-14 (later): Local model served on the GPU cluster
 - Decisions (Shashank): **vLLM** (over Ollama; forced tool-call format helps a
   small model, per Om's guidance) and **SSH key login** from the laptop
