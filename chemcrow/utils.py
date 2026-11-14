@@ -77,7 +77,10 @@ def pubchem_query2smiles(
     data = r.json()
     # return the SMILES string
     try:
-        smi = data["PropertyTable"]["Properties"][0]["IsomericSMILES"]
+        props = data["PropertyTable"]["Properties"][0]
+        # PubChem renamed this field (by 2026-11): "IsomericSMILES" now comes back
+        # as "SMILES". Accept either, so lookups work with the old and new API.
+        smi = props.get("SMILES") or props["IsomericSMILES"]
     except KeyError:
         return "Could not find a molecule matching the text. One possible cause is that the input is incorrect, input one molecule at a time."
     return str(Chem.CanonSmiles(largest_mol(smi)))

@@ -10,6 +10,7 @@ the ChemCrow tool-calling evaluation. Set up and first tested 2026-11-14.
 | [smoke_test.py](smoke_test.py) | Quick "is it alive and can it call tools?" check |
 | [opv_tools.py](opv_tools.py) | 4 **real** tools over Kyle's 4,023 OPV molecules (look up, most similar, properties, compare) |
 | [agent.py](agent.py) | **Multi-step tool calling**: each tool result is fed back so the model can pick the next call |
+| [chemcrow_tools.py](chemcrow_tools.py) | **12 of ChemCrow's own tools** (+ the 4 OPV tools = 16), callable natively, grouped into toolsets |
 
 The copies that actually run live on the cluster in `~/llm/` (= `/home2/sathiysk/llm`).
 After editing a script here, copy it over again (see "Updating a script" below).
@@ -20,7 +21,9 @@ After editing a script here, copy it over again (see "Updating a script" below).
 ~/llm/
 ├── venv/          the SERVER's Python 3.12 environment: vLLM 0.33.0, transformers 5.20, torch 2.14 (15 GB).
 │                  Install nothing else here: other packages can upgrade numpy past what vLLM accepts.
-├── agent-venv/    the AGENT's environment: openai, rdkit, pandas
+├── agent-venv/    the AGENT's environment for the OPV tools: openai, rdkit, pandas
+├── chemcrow-venv/ Python 3.10 + ChemCrow with the laptop's .venv-chemcrow versions (LangChain 0.0.275)
+├── chemcrow-src/  a copy of the repo's chemcrow/ package (installed editable into chemcrow-venv)
 ├── data/          classified_opv_database.csv (Kyle's molecule list)
 ├── opv_tools.py, agent.py
 ├── hf/            the downloaded model Qwen/Qwen3.8-27B, BF16 (70 GB)
@@ -172,6 +175,80 @@ QUESTION: How many aromatic rings does IT-4FF have? I may have misspelled the na
   2× longer (9–17 s vs 4–9 s per question), so **off is the better default**
   here. The real eval will test this on many more questions.
 - Every run is saved as a full transcript in `~/llm/logs/agent/` (JSON).
+
+## ChemCrow's tools (chemcrow_tools.py + agent.py --tools chemcrow)
+
+**What it is:** the same loop, now calling **ChemCrow's own tool code** (not
+rewrites): 12 of its tools plus our 4 OPV tools, 16 in all.
+
+| Used (12) | Left out (and why) |
+|---|---|
+| Name2SMILES, Mol2CAS, SMILES2Name, PatentCheck, MolSimilarity, SMILES2Weight, FunctionalGroups, ExplosiveCheck, ControlChemCheck, SimilarityToControlChem, SafetySummary, Wikipedia | `python_repl` (would let the model run any code), `CustomTool` (empty), `LiteratureSearch` (needs an OpenAI key), `GetMoleculePrice`, `WebSearch`, `ReactionPredict`, `ReactionRetrosynthesis` (need ChemSpace / SerpAPI / IBM RXN keys we don't have) |
+
+**Help for the small model, added around ChemCrow's tools:**
+- **Names instead of SMILES:** every molecule argument accepts a name or a SMILES.
+  Our code converts names (Kyle's OPV list first, then PubChem), so the model
+  never copies long SMILES. ChemCrow's own tools only take SMILES.
+- **CAS conversion in code:** ExplosiveCheck and SafetySummary need a CAS
+  number. Our code gets it automatically, instead of the model chaining that step.
+- **Time limits:** 90 s per tool (SafetySummary 360 s; it asks the LLM to
+  summarise ~11 PubChem sections).
+- **Toolsets:** `lookup`, `analysis`, `safety`, `patents`, `opv` (3–4 tools each).
+  With `--toolset auto`, a **router** call first picks the groups. It's forced
+  to answer only with valid group names, then the model sees just those tools.
+
+**Two ChemCrow bugs fixed** (in our fork, `chemcrow/`): PubChem renamed things in
+its API, which broke every name lookup and the explosive check, even for
+ChemCrow's original agent:
+- `utils.py`: PubChem now returns `"SMILES"` instead of `"IsomericSMILES"`.
+- `tools/safety.py`: the section `"Chemical Safety"` is now called `"Primary Hazards"`.
+
+Both now accept the old and new names. After editing `chemcrow/` here, copy the
+changed file to `~/llm/chemcrow-src/chemcrow/` on the cluster.
+
+**Run it.** It must use `chemcrow-venv`. **Loading takes about 3.5 minutes**,
+because Python reads ChemCrow's large libraries from the network drive. So for
+a demo use **interactive mode**: load once, then ask as many questions as you
+like.
+
+```powershell
+# Interactive demo (-t gives you a real terminal to type in)
+ssh -t uc-gpu 'cd ~/llm && ~/llm/chemcrow-venv/bin/python agent.py --tools chemcrow --toolset auto -i'
+
+# The 5 demo questions, all 16 tools vs the router, with a comparison table
+ssh uc-gpu 'cd ~/llm && ~/llm/chemcrow-venv/bin/python agent.py --tools chemcrow --compare'
+```
+
+**Results (2026-11-14), all 16 tools vs router (`auto`):**
+
+| Question | all 16 tools | router (auto) |
+|---|---|---|
+| Molecular weight of caffeine + its functional groups | ✅ 5.1 s | ✅ lookup+analysis (7 tools), 6.2 s |
+| Is nitroglycerin explosive? Is it controlled? | ✅ 10.6 s | ✅ lookup+safety (8 tools), 7.0 s |
+| CAS number of aspirin, then is it patented? | ✅ 5.4 s | ✅ lookup+patents (5 tools), 7.1 s |
+| How similar are Y6 and ITIC, and is Y6 patented? | ✅ 8.0 s | ✅ opv+patents (5 tools), 12.2 s |
+| SMILES of paracetamol, then its functional groups | ✅ 5.0 s | ✅ lookup+analysis (7 tools), 9.0 s |
+
+✅ = used the expected tools, with 0 errors. Example answer: *"Yes, nitroglycerin is
+classified as explosive (per PubChem GHS data). However, it is not a controlled
+chemical: its highest similarity to any known controlled substance is only 0.2."*
+
+**How to read it:**
+- **Both modes got all 5 right**, and the router picked sensible groups every
+  time. On questions this clear, 16 tools aren't too many for this model. The
+  router costs one extra short call (~1.5–2 s).
+- So the router's benefit **isn't proven yet**. That needs the real eval:
+  more questions, including harder and more ambiguous ones, where too many
+  tools may confuse the model. That's the next step.
+- **Caveats about ChemCrow's tools themselves** (worth saying when presenting):
+  - FunctionalGroups uses a fixed pattern list and can mislabel groups (e.g.
+    "ketones" for caffeine, "terminal aldehyde" for paracetamol).
+  - PatentCheck's "Novel" only means "not in its SureChEMBL catalogue", not
+    "not patented". The model overstated this for Y6.
+  - ControlChemCheck always says "safe" when similarity is low, which is
+    overconfident (see `orchestrator/docs/chemcrow-tools.md`).
+  - The eval measures whether the model **picks** the right tool, not the
+    tools' accuracy.
 
 ## Settings to remember
 

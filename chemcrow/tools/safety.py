@@ -52,7 +52,9 @@ class MoleculeSafety:
             return "Molecule not found in Pubchem."
         try:
             for section in data["Record"]["Section"]:
-                if section.get("TOCHeading") == "Chemical Safety":
+                # PubChem renamed this section (by 2026-11) from "Chemical Safety"
+                # to "Primary Hazards"; same content. Accept either.
+                if section.get("TOCHeading") in ("Chemical Safety", "Primary Hazards"):
                     ghs = [
                         markup["Extra"]
                         for markup in section["Information"][0]["Value"][

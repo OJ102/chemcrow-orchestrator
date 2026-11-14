@@ -191,7 +191,9 @@ $env:ORCHESTRATOR_API_TOKEN = "secret"; .\.venv-langgraph\Scripts\python.exe -m 
    serving `Qwen/Qwen3.8-27B` on GPU 2 (tmux session `vllm`, port 8200,
    SSH key login `ssh uc-gpu`); smoke test passed. **Multi-step tool calling
    works** (`cluster/agent.py` + 4 real tools over Kyle's molecules in
-   `cluster/opv_tools.py`; results feed into the next call; demo-ready). How-to:
+   `cluster/opv_tools.py`; results feed into the next call; demo-ready), and
+   **with 12 of ChemCrow's own tools** (`cluster/chemcrow_tools.py`, toolsets +
+   router, `--compare`; 2 PubChem-rename bugs fixed in `chemcrow/`). How-to:
    [cluster/README.md](../../cluster/README.md). **Next: the tool-choice eval.**
    Original plan, for the
    ChemCrow tool-calling eval. Shashank's order (2026-11-02, MCP step dropped

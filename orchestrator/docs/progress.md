@@ -123,6 +123,31 @@ spec in many places and must be reshaped before real tools are connected.
 
 ## Log
 
+### 2026-11-14 (night): ChemCrow's own tools in the tool-calling loop
+- Shashank: the model must call ChemCrow's tools too, not just our 4 OPV tools.
+  Decisions: **toolsets plus a comparison** (all tools vs small groups chosen by
+  a router); **no API keys** for now.
+- Cluster: new `~/llm/chemcrow-venv` (Python 3.10 via uv, same versions as the
+  laptop's `.venv-chemcrow`, plus `setuptools<81`) with the repo's `chemcrow/`
+  installed editable.
+- `cluster/chemcrow_tools.py`: 12 ChemCrow tools (python_repl, CustomTool,
+  LiteratureSearch and the 4 API-key tools left out) + 4 OPV tools. Names are
+  resolved to SMILES in code, CAS conversion is done in code, time limits are set,
+  and there are 5 toolsets.
+- `cluster/agent.py`: `--tools opv|chemcrow`, `--toolset all|auto|NAME`
+  (router = one forced call that can only output valid group names),
+  `--compare`, `-i` interactive mode (ChemCrow takes ~3.5 min to load from
+  NFS), expected-tool checks; uses Python's built-in HTTP client
+  (ChemCrow's venv has the old openai 0.27).
+- **Fixed two ChemCrow bugs caused by PubChem API renames** (they broke every
+  name lookup and ExplosiveCheck, also for ChemCrow's original agent):
+  `IsomericSMILES` → `SMILES` (`chemcrow/utils.py`), `Chemical Safety` →
+  `Primary Hazards` (`chemcrow/tools/safety.py`). Both names accepted.
+- Results: 5/5 ChemCrow demo questions with the expected tools and 0 errors,
+  both with all 16 tools and with the router; OPV demo still 4/4. The router
+  costs ~1.5–2 s and its benefit isn't shown on easy questions, so the real
+  eval needs harder questions.
+
 ### 2026-11-14 (evening): Multi-step tool calling works
 - Shashank: feed each tool's result into the next call (sequential tool
   calling), presentable. Decisions: **real tools** over Kyle's molecule list;
