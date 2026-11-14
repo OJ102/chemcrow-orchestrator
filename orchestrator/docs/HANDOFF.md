@@ -187,20 +187,29 @@ $env:ORCHESTRATOR_API_TOKEN = "secret"; .\.venv-langgraph\Scripts\python.exe -m 
    **Not suitable** as the near-miss repair tool. Details are in progress.md.
    To do: tell Jaxon; tell Kyle that Y6 and L8-BO are labelled `donor` in
    `classified_opv_database.csv`.
-2. **Re-implement useful ChemCrow screens** (next) with structured results: controlled-
-   chemical similarity (a hard stop), molecular similarity (for the bounded,
-   diverse near-miss archive), patent check, and AiZynthFinder retrosynthesis
-   for finalists. See [chemcrow-tools.md](chemcrow-tools.md). Coordinate with
-   Jaxon (validation is C3) and Nyla (finalists are C5).
-3. **Local LLM on the GPU cluster** for the ChemCrow tool-calling eval:
+2. **Local LLM on the GPU cluster** (in progress). **Done 2026-11-14:** vLLM
+   serving `Qwen/Qwen3.8-27B` on GPU 2 (tmux session `vllm`, port 8200,
+   SSH key login `ssh uc-gpu`); smoke test passed. How-to:
+   [cluster/README.md](../../cluster/README.md). **Next: the tool-choice eval.**
+   Original plan, for the
+   ChemCrow tool-calling eval. Shashank's order (2026-11-02, MCP step dropped
+   2026-11-06): (a) set up our GPUs, (b) serve the local model, (c) sequential
+   tool calling + an eval of tool choice.
    - Cluster `cs-gpu-00.digitfut.uc.edu`: 4× A100 80 GB, no sudo, shared
      with another capstone team (GPUs 0/1 theirs, 2/4 ours). The root disk is
-     97% full, so use `/home2/sathiysk`.
-   - Model: the 27b Qwen. **Pending decision: vLLM vs Ollama** (vLLM recommended).
-   - Then sequential tool calling plus an eval of tool choice, with the MCP
-     expert's advice: a small tool subset per use case, fixed sequences in
-     code, and capped LLM retries.
-4. Later: connect the real tools (Jaxon, Arleen, Kyle) to the slots, the
+     97% full, so use `/home2/sathiysk`. A shared Ollama already runs on port
+     11434; if we use Ollama, run our own on another port with models in home.
+   - Model: the 27b Qwen. **Om's guidance (2026-11-14): the model is small, so
+     optimize hard for it.** Don't rely on its reasoning: constrained/structured
+     output for tool calls, very few tools per step, fixed sequences in code,
+     short prompts with examples, low temperature, capped retries, and an
+     eval to measure what actually helps.
+3. **Re-implement useful ChemCrow screens** (optional, later; overlaps with
+   Jaxon's C3 validation and Nyla's C5 finalists) with structured results:
+   controlled-chemical similarity (a hard stop), molecular similarity (for the
+   bounded, diverse near-miss archive), patent check, and AiZynthFinder
+   retrosynthesis for finalists. See [chemcrow-tools.md](chemcrow-tools.md).
+4. Later (waiting on teammates): connect the real tools (Jaxon, Arleen, Kyle) to the slots, the
    bounded diverse near-miss archive, full structured repair instructions,
    an LLM step for objective → constraints, and D2 Handoff/Feedback records
    for human reviews.

@@ -123,6 +123,34 @@ spec in many places and must be reshaped before real tools are connected.
 
 ## Log
 
+### 2026-11-14 (later): Local model served on the GPU cluster
+- Decisions (Shashank): **vLLM** (over Ollama; forced tool-call format helps a
+  small model, per Om's guidance) and **SSH key login** from the laptop
+  (`ssh uc-gpu`; revocable).
+- Installed in `~/llm` on `cs-gpu-00`: vLLM 0.33.0, transformers 5.23, torch 2.14;
+  model **`Qwen/Qwen3.8-27B`** (BF16, the same model ChemCrow was configured
+  for), downloaded in 13 min. GPUs 2 and 4 were free; GPU 0 has another
+  user's small job.
+- Server: GPU 2 only (GPU 4 left free), port 8200, localhost only, API key,
+  32K-token limit, text only, `qwen3_coder` tool parser + `qwen3` reasoning
+  parser (the official vLLM recipe's settings). Runs in tmux session `vllm`.
+- Smoke test: correct tool and argument in all 3 tool tests (`auto`,
+  `required`, thinking on); ~20–27 tokens/s per request.
+- Scripts and how-to: `cluster/` ([cluster/README.md](../../cluster/README.md)).
+- Next: the tool-choice eval (expected tool per question, a small tool subset,
+  fixed sequences in code), comparing thinking on/off and `auto`/`required`.
+
+### 2026-11-14: Next-step order fixed; GPU work started
+- **Order corrected (Shashank):** after items 1–6 and the SynSpace test comes
+  the **GPU cluster / local model** work. The ChemCrow screens are optional
+  and later. (HANDOFF had them the other way round.) Items needing
+  teammates' tools wait.
+- **Om's guidance:** the local model has relatively few parameters, so it isn't
+  very smart; optimize the setup well for it. Plan: constrained/structured tool-call
+  output, a very small tool subset per step, fixed sequences in code,
+  short prompts with examples, low temperature, capped retries, and let the
+  eval measure which of these help.
+
 ### 2026-11-10 (latest): Run guide; push access
 - **`docs/running.md`** (new): step by step for the tests, demo, saved runs,
   API + worker (with a ready-to-paste `POST /runs` body) and the SynSpace
